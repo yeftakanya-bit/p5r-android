@@ -108,12 +108,39 @@ static bool tdata_range(const ModuleInfo& m, uint64_t& start, uint64_t& end) {
     return start <= end && end - start <= 0x1000 && start >= m.base && end <= m.base + 0x10000000;
 }
 
+// A module's DT_INIT word is usable when it is not an all-zero or all-one word: 0x0000xxxx is the permanently
+// undefined UDF encoding and 0xFFFFFFFF an erased word, both of which fault when executed.
+static bool dt_init_usable(uint32_t word) { return (word >> 16) != 0 && word != 0xFFFFFFFFu; }
+
 static void init_module(CPU& c, const ModuleInfo& m) {
+    const uint32_t dt_init = ld<uint32_t>(m.base + kDtInit);
+    log("init_module %s: DT_INIT at %llx = %08x, init_array %p with %zu entries", m.name,
+        (unsigned long long)(m.base + kDtInit), dt_init, (const void*)m.init_array, size_t(m.init_count));
+    if (!dt_init_usable(dt_init)) {
+        // An SDK 2017 module may have no DT_INIT here, or its work was done by nninitInitializeSdkModule: nothing to
+        // run, and the constructors are only run on request (NX_FORCE_CTORS=1), as they may already have run.
+        log("init_module %s: DT_INIT is %08x, not code: skipped", m.name, dt_init);
+        const char* force = std::getenv("NX_FORCE_CTORS");
+        if (force && force[0] == '1' && m.init_array) {
+            for (size_t k = 0; k < m.init_count; k++) call_preserving(c, m.base + m.init_array[k]);
+            log("init_module %s: %zu constructors run (NX_FORCE_CTORS=1)", m.name, size_t(m.init_count));
+        }
+        return;
+    }
+    log("init_module %s: calling DT_INIT", m.name);
     call_preserving(c, m.base + kDtInit);
+    log("init_module %s: DT_INIT returned", m.name);
     uint32_t status = ld<uint32_t>(init_status_addr(m));
-    if (status == 1)
+    log("init_module %s: init status %u", m.name, status);
+    if (status == 1) {
+        if (!m.init_array && m.init_count) {
+            log("init_module %s: init_array is null but has %zu entries: constructors skipped", m.name,
+                size_t(m.init_count));
+            return;
+        }
         for (size_t k = 0; k < m.init_count; k++) call_preserving(c, m.base + m.init_array[k]);
-    log("%s constructors: %zu", m.name, status == 1 ? m.init_count : 0);
+    }
+    log("%s constructors: %zu", m.name, status == 1 ? size_t(m.init_count) : size_t(0));
 }
 
 static void rtld_init(CPU&) {}
@@ -283,12 +310,16 @@ static void run_pre_init(CPU& c) {
 // nnMain, as called by nn::init::Start: the constructors need the program's allocator, which nninitStartup has
 // set up by now, so they run here, right before the real nnMain.
 static void nn_main(CPU& c) {
+    log("nn_main: initializing the sdk module");
     init_module(c, *g_sdk);
+    log("nn_main: sdk module initialized, initializing the main module");
     init_module(c, *g_main);
+    log("nn_main: main module initialized, game::after_init()");
     game::after_init();
-    log("entering nnMain");
+    log("nn_main: after_init done");
     const uint64_t real = module_symbol(*g_main, "nnMain");
     if (!real) fatal("nnMain not found in the main module");
+    log("entering nnMain at %s", describe(real).c_str());
     call(c, real);
 }
 
@@ -482,6 +513,7 @@ void boot() {
             }
             c.x[0] = main_thread;
             c.x[30] = hle_address("__process_return");
+            log("calling nn_main (main thread handle %u)", main_thread);
             nn_main(c);
             log("returned from nnMain");
             plat::exit_process(0);
