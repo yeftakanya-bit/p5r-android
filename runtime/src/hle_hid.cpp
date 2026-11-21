@@ -351,6 +351,38 @@ void GetTouchScreenState(CPU& c) {
     st<int32_t>(c.x[0] + 8, 0);
 }
 
+// SDK 2017 (Farming Simulator): the plural form. TouchScreenState<16> starts {int64 samplingNumber; int32 count;
+// int32 reserved}: one state with no touches, like GetMouseStates.
+void fill_no_touch(uint64_t out) {
+    st<int64_t>(out, int64_t(g_sampling));
+    st<int32_t>(out + 8, 0);   // count: no touches
+    st<int32_t>(out + 12, 0);  // reserved
+}
+
+// int nn::hid::GetTouchScreenStates<16>(TouchScreenState<16>* out, int count): the number of states written.
+void GetTouchScreenStates(CPU& c) {
+    if (int(c.x[1]) < 1) {
+        c.x[0] = 0;
+        return;
+    }
+    fill_no_touch(c.x[0]);
+    c.x[0] = 1;
+}
+
+// Result nn::hid::detail::GetTouchScreenStates<16>(int* outCount, TouchScreenState<16>* out, int count): the SDK's own
+// version reads the hid shared memory (a RingLifo), which this runtime does not map: it faulted there.
+void GetTouchScreenStatesDetail(CPU& c) {
+    const uint64_t out_count = c.x[0], out = c.x[1];
+    const int count = int(c.x[2]);
+    int written = 0;
+    if (count >= 1 && out) {
+        fill_no_touch(out);
+        written = 1;
+    }
+    if (out_count) st<int32_t>(out_count, written);
+    c.x[0] = 0;  // ResultSuccess
+}
+
 void populate_sixaxis(uint64_t s) {
     for (uint64_t k = 0; k < 0x5c; k += 4) st<uint32_t>(s + k, 0);
     st<int64_t>(s, 16666666);           // deltaTime: ~16.6ms
@@ -465,6 +497,10 @@ NX_HLE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19Si
 // SDK 13 (Persona 5 Royal)
 NX_HLE("_ZN2nn3hid21InitializeTouchScreenEv", noop);
 NX_HLE("_ZN2nn3hid19GetTouchScreenStateILm16EEEvPNS0_16TouchScreenStateIXT_EEE", GetTouchScreenState);
+// SDK 2017 (Farming Simulator Nintendo Switch Edition)
+NX_HLE("_ZN2nn3hid20GetTouchScreenStatesILm16EEEiPNS0_16TouchScreenStateIXT_EEEi", GetTouchScreenStates);
+NX_HLE("_ZN2nn3hid6detail20GetTouchScreenStatesILm16EEENS_6ResultEPiPNS0_16TouchScreenStateIXT_EEEi",
+       GetTouchScreenStatesDetail);
 NX_HLE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", GetSixAxisSensorState);
 NX_HLE("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", noop);
 NX_HLE("_ZN2nn3hid34ResetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleE", noop);
