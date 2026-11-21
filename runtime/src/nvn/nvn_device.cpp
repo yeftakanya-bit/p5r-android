@@ -2,6 +2,8 @@
 // (recompiled in sdk; NX_NVN_REAL=1 records where each of its procs lives, see nvn_trace.cpp).
 #include <atomic>
 #include <map>
+#include <mutex>
+#include <set>
 
 #include <nx/runtime.h>
 
@@ -26,7 +28,8 @@ const std::map<uint32_t, int32_t> kDeviceInfo = {
     {6, 0x10},
     {7, 0x4},
     {8, 0x10},
-    {9, 0x20},
+    {9, 0x0},  // Farming Simulator (SDK 2017): its check "LINEAR_TEXTURE_STRIDE_ALIGNMENT is %d, should be 0" wants 0. This table
+               // is the SDK 16 numbering; 0x20 was what P5R and Wonder get here.
     {10, 0x10},
     {11, 0x4},
     {12, 0x4},
@@ -121,8 +124,20 @@ const std::map<uint32_t, int32_t> kDeviceInfo = {
 void nvnDeviceGetInteger(CPU& c) {
     uint32_t pname = uint32_t(c.x[1]);
     auto it = kDeviceInfo.find(pname);
+    const int32_t value = it == kDeviceInfo.end() ? 0 : it->second;
     if (it == kDeviceInfo.end()) log("nvn: nvnDeviceGetInteger(%u) unknown -> 0 (lr %s)", pname, describe(c.x[30]).c_str());
-    if (c.x[2]) st<int32_t>(c.x[2], it == kDeviceInfo.end() ? 0 : it->second);
+    {
+        // Each pname the game asks for, once, with the answer: the numbering of an older NVN differs from this table's.
+        static std::mutex seen_lock;
+        static std::set<uint32_t> seen;
+        bool first;
+        {
+            std::lock_guard lk(seen_lock);
+            first = seen.insert(pname).second;
+        }
+        if (first) log("nvn: nvnDeviceGetInteger(%u) -> %#x (lr %s)", pname, uint32_t(value), describe(c.x[30]).c_str());
+    }
+    if (c.x[2]) st<int32_t>(c.x[2], value);
 }
 
 // NVNboolean nvnDeviceRegisterFastClear{Color,Colori,Colorui,Depth}(device, value(s), format): the driver keeps a
