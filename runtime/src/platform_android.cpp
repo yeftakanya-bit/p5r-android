@@ -783,6 +783,21 @@ struct sigaction g_previous[32];  // the handlers before ours (debuggerd's)
 void crash(int sig, siginfo_t* info, void* uc) {
     if ((sig == SIGSEGV || sig == SIGBUS) && nx::plat::write_watch_fault(info->si_addr)) return;  // write_watch.cpp
     nx::log("CRASH: signal %d, fault address %p", sig, info->si_addr);
+    {
+        // Where the fault happened: a host library (the runtime itself) or guest/stub code (not in any library).
+        const mcontext_t& mc = static_cast<ucontext_t*>(uc)->uc_mcontext;
+        Dl_info d{};
+        if (dladdr(reinterpret_cast<void*>(mc.pc), &d) && d.dli_fbase) {
+            const char* slash = d.dli_fname ? std::strrchr(d.dli_fname, '/') : nullptr;
+            nx::log("  host pc %llx in %s+%llx (%s), lr %llx", (unsigned long long)mc.pc,
+                    d.dli_fname ? (slash ? slash + 1 : d.dli_fname) : "?",
+                    (unsigned long long)(mc.pc - uint64_t(d.dli_fbase)), d.dli_sname ? d.dli_sname : "no symbol",
+                    (unsigned long long)mc.regs[30]);
+        } else {
+            nx::log("  pc %llx is not in a host library (guest or stub code), lr %llx", (unsigned long long)mc.pc,
+                    (unsigned long long)mc.regs[30]);
+        }
+    }
 #if NX_NCE
     // In the game's own code: its registers are in the signal's context, not in the thread's CPU.
     if (nx::self_thread()) {
