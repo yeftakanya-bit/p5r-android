@@ -72,6 +72,35 @@ void remove_tree(const std::string& path) {
     rmdir(path.c_str());
 }
 
+// mkdir -p: creates every missing parent directory, one level at a time. 0 on success (or if it already exists),
+// else -1 with errno of the level that failed.
+int mkdir_p(const std::string& path, mode_t mode) {
+    if (path.empty()) {
+        errno = EINVAL;
+        return -1;
+    }
+    std::string cur;
+    cur.reserve(path.size());
+    size_t i = 0;
+    while (i < path.size()) {
+        size_t j = path.find('/', i);
+        if (j == std::string::npos) j = path.size();
+        cur += path.substr(i, j - i);
+        if (!cur.empty()) {
+            if (mkdir(cur.c_str(), mode) != 0 && errno != EEXIST) return -1;
+            struct stat st{};
+            if (stat(cur.c_str(), &st) != 0) return -1;
+            if (!S_ISDIR(st.st_mode)) {
+                errno = ENOTDIR;
+                return -1;
+            }
+        }
+        if (j < path.size()) cur += '/';
+        i = j + 1;
+    }
+    return 0;
+}
+
 int fail(const std::string& e) {
     set_error(e);
     g_phase = 0;
@@ -109,9 +138,15 @@ int run(int nsp_fd, const std::string& nsp_name, const std::string& keys, const 
     g_phase = 4;
     const std::string out = data_dir + "/spirv";
     remove_tree(out);  // stale files of another game (Persona 5 Royal's translated shaders) must not stay
-    if (mkdir(out.c_str(), 0700) != 0 && errno != EEXIST) return fail("cannot create " + out);
+    if (mkdir_p(out, 0777) != 0) {
+        const int e = errno;  // saved before anything else can change it
+        return fail("cannot create " + out + ": " + std::strerror(e) + " (errno " + std::to_string(e) + ")");
+    }
     FILE* f = std::fopen((out + "/import.txt").c_str(), "w");
-    if (!f) return fail("cannot write " + out + "/import.txt");
+    if (!f) {
+        const int e = errno;
+        return fail("cannot write " + out + "/import.txt: " + std::strerror(e) + " (errno " + std::to_string(e) + ")");
+    }
     std::fprintf(f, "%s\n%s\n", nsp_name.c_str(), id);
     std::fclose(f);
     g_phase = 5;
