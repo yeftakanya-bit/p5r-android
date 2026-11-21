@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <malloc.h>
 #include <unistd.h>
@@ -30,6 +31,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -390,7 +392,44 @@ bool make_dirs(const std::string& path) {
     return !ec;
 }
 
-void log_line(const char* line) { __android_log_write(ANDROID_LOG_INFO, nx::game::kInfo.id, line); }
+// ---- nx.log ----------------------------------------------------------------------------------------------------
+// Every log line goes to logcat (tag P5RFarm) and is appended to Internal storage/Persona 5 Royal/nx.log. The file is
+// opened, written, flushed and closed for each line, so nothing is lost when the process dies (fatal(), _exit, a
+// signal). The folder name is the launcher's (Launcher.DATA) and must not follow the game's display title.
+static const char* const kDataFolder = "Persona 5 Royal";
+static const char* const kLogDir = "/storage/emulated/0/Persona 5 Royal";
+static const char* const kLogFile = "/storage/emulated/0/Persona 5 Royal/nx.log";
+static const char* const kLogPrev = "/storage/emulated/0/Persona 5 Royal/nx.log.prev";
+static std::mutex g_log_mutex;
+
+void log_line(const char* line) {
+    if (!line) return;
+    __android_log_write(ANDROID_LOG_INFO, "P5RFarm", line);
+    // try_to_lock: the signal handler logs too; if it interrupted a thread that is inside this function, waiting for
+    // the lock would hang the dying process, so it writes anyway (a short append).
+    std::unique_lock<std::mutex> lock(g_log_mutex, std::try_to_lock);
+    FILE* f = std::fopen(kLogFile, "a");
+    if (!f) {
+        mkdir(kLogDir, 0777);  // the folder may not exist yet
+        f = std::fopen(kLogFile, "a");
+    }
+    if (!f) return;
+    std::fputs(line, f);
+    const size_t n = std::strlen(line);
+    if (n == 0 || line[n - 1] != '\n') std::fputc('\n', f);
+    std::fflush(f);
+    std::fclose(f);
+}
+
+// A new session: the last nx.log becomes nx.log.prev (replacing the older one), so nx.log only holds this start.
+// Returns 0, or the errno of a failed rename.
+static int rotate_nx_log() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    struct stat st{};
+    if (stat(kLogFile, &st) != 0) return 0;  // none from a previous session
+    if (std::rename(kLogFile, kLogPrev) != 0) return errno;
+    return 0;
+}
 
 std::string data_root() { return g_root; }
 
@@ -1285,6 +1324,10 @@ static bool has_data(const std::string& root) { return access((root + kDataProbe
 
 extern "C" void android_main(android_app* app) {
     using namespace nx::plat;
+    // First thing: the previous session's nx.log is moved aside, so every Play starts a clean nx.log.
+    const int rotate_rc = rotate_nx_log();
+    nx::log("nx.log: new session (previous one is nx.log.prev%s%s)", rotate_rc ? ", rename failed: " : "",
+            rotate_rc ? std::strerror(rotate_rc) : "");
     g_app = app;
     if (app && app->activity && app->activity->internalDataPath && g_internal_dir.empty()) {
         g_internal_dir = app->activity->internalDataPath;
@@ -1298,7 +1341,8 @@ extern "C" void android_main(android_app* app) {
         std::getline(f, chosen);
         while (!chosen.empty() && (chosen.back() == '\r' || chosen.back() == '\n' || chosen.back() == ' ')) chosen.pop_back();
     }
-    const std::string shared = !chosen.empty() ? chosen : std::string("/storage/emulated/0/") + nx::game::kInfo.title;
+    // kDataFolder, not kInfo.title: the title is only the game's display name now.
+    const std::string shared = !chosen.empty() ? chosen : std::string("/storage/emulated/0/") + kDataFolder;
     const std::string own = (app && app->activity && app->activity->externalDataPath) ? app->activity->externalDataPath : shared;
     const bool has_image = (std::getenv("NX_GAME_FD") && *std::getenv("NX_GAME_FD")) ||
                            (std::getenv("NX_GAME_NSP") && *std::getenv("NX_GAME_NSP"));
