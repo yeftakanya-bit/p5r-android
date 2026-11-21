@@ -6,6 +6,10 @@
 //   - a builder or state object proc (pure struct setters/getters): the SDK driver's own, recompiled (see nvn.h);
 //   - anything else: a tracing stub that records the call and returns a neutral value, so the trace goes as far
 //     as it can.
+//   - a builder proc the SDK driver does not give (an SDK 2017 game: nvn::real_proc returns 0): the host's own
+//     version below (MemoryPoolBuilder: kept in the builder's 64 bytes), instead of a stub that stores nothing.
+// Every name the game asks for is logged to nx.log (once per name, with where it was resolved), and a null answer
+// always is.
 // The trace is <data root>/nvn_trace.txt: one line per call (the first kFullCalls of each proc), each proc's
 // driver address ("# real"), and a count per proc at exit.
 #include <atomic>
@@ -15,6 +19,7 @@
 #include <map>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <string>
 
 #include "nvn.h"
@@ -84,14 +89,139 @@ bool driver_serves(const std::string& name) {
     return std::regex_match(name, pure) && !std::getenv("NX_NVN_NO_DRIVER");
 }
 
-uint64_t proc_address(CPU& c, const std::string& name) {
-    if (name.empty()) return 0;
+// ---- host MemoryPoolBuilder ------------------------------------------------------------------------------------
+// NVNmemoryPoolBuilder is 64 opaque bytes the game only touches through these procs, so the host can keep its own
+// layout in them. Used when the SDK's driver has no proc for the name (nvn::real_proc returned 0).
+struct HostPoolBuilder {
+    uint64_t device;      // +0x00 NVNdevice*
+    uint64_t memory;      // +0x08 void* storage
+    uint64_t size;        // +0x10 storage size
+    uint32_t flags;       // +0x18 NVNmemoryPoolFlags
+    uint32_t reserved0;   // +0x1c
+    uint64_t reserved1[3];  // +0x20
+    uint64_t magic;       // +0x38 kPoolBuilderMagic: built by the host procs
+};
+static_assert(sizeof(HostPoolBuilder) == 64, "NVNmemoryPoolBuilder is 64 bytes");
+constexpr uint64_t kPoolBuilderMagic = 0x42504d48;  // "HMPB"
+
+HostPoolBuilder* pool_builder(CPU& c) {
+    auto* b = reinterpret_cast<HostPoolBuilder*>(c.x[0]);
+    if (b) b->magic = kPoolBuilderMagic;
+    return b;
+}
+
+// void nvnMemoryPoolBuilderSetDefaults(NVNmemoryPoolBuilder*): no device, no storage, no flags (the game sets them).
+void host_pool_builder_set_defaults(CPU& c) {
+    if (auto* b = reinterpret_cast<HostPoolBuilder*>(c.x[0])) {
+        std::memset(b, 0, sizeof *b);
+        b->magic = kPoolBuilderMagic;
+    }
+}
+// void nvnMemoryPoolBuilderSetDevice(NVNmemoryPoolBuilder*, NVNdevice*)
+void host_pool_builder_set_device(CPU& c) {
+    if (auto* b = pool_builder(c)) b->device = c.x[1];
+}
+// void nvnMemoryPoolBuilderSetFlags(NVNmemoryPoolBuilder*, int flags)
+void host_pool_builder_set_flags(CPU& c) {
+    if (auto* b = pool_builder(c)) b->flags = uint32_t(c.x[1]);
+}
+// void nvnMemoryPoolBuilderSetStorage(NVNmemoryPoolBuilder*, void* memory, size_t size)
+void host_pool_builder_set_storage(CPU& c) {
+    if (auto* b = pool_builder(c)) b->memory = c.x[1], b->size = c.x[2];
+}
+// const NVNdevice* nvnMemoryPoolBuilderGetDevice(const NVNmemoryPoolBuilder*)
+void host_pool_builder_get_device(CPU& c) {
+    auto* b = reinterpret_cast<HostPoolBuilder*>(c.x[0]);
+    c.x[0] = b ? b->device : 0;
+}
+// void* nvnMemoryPoolBuilderGetMemory(const NVNmemoryPoolBuilder*)
+void host_pool_builder_get_memory(CPU& c) {
+    auto* b = reinterpret_cast<HostPoolBuilder*>(c.x[0]);
+    c.x[0] = b ? b->memory : 0;
+}
+// size_t nvnMemoryPoolBuilderGetSize(const NVNmemoryPoolBuilder*)
+void host_pool_builder_get_size(CPU& c) {
+    auto* b = reinterpret_cast<HostPoolBuilder*>(c.x[0]);
+    c.x[0] = b ? b->size : 0;
+}
+// NVNmemoryPoolFlags nvnMemoryPoolBuilderGetFlags(const NVNmemoryPoolBuilder*)
+void host_pool_builder_get_flags(CPU& c) {
+    auto* b = reinterpret_cast<HostPoolBuilder*>(c.x[0]);
+    c.x[0] = b ? b->flags : 0;
+}
+
+// The host's version of a builder proc, registered below as "host_<nvn name>"; 0 when there is none.
+uint64_t host_builder_proc(const std::string& name) {
+    const std::string host = "host_" + name;
+    return hle_lookup(host.c_str()) ? hle_address(host.c_str()) : 0;
+}
+
+// One line in nx.log for each name the game asks for (the first time), and for every null answer.
+void note_proc(const char* who, uint64_t device, const std::string& name, const char* how, uint64_t addr) {
+    static std::mutex m;
+    static std::set<std::string> seen;
+    bool first;
+    {
+        std::lock_guard lk(m);
+        first = seen.insert(name).second;
+    }
+    if (!addr)
+        log("nvn: %s(%llx, %s) -> 0 (%s): the game gets a null function pointer", who, (unsigned long long)device,
+            name.c_str(), how);
+    else if (first)
+        log("nvn: %s(%llx, %s) -> %s at %s", who, (unsigned long long)device, name.c_str(), how, describe(addr).c_str());
+}
+
+uint64_t proc_address(CPU& c, const std::string& name, const char* who, uint64_t device) {
+    static const bool loader_noted = [&] {
+        const uint64_t loader = find_symbol("nvnBootstrapLoader");
+        log("nvn: the sdk's own nvnBootstrapLoader (the driver): %s", loader ? describe(loader).c_str() : "not found");
+        return true;
+    }();
+    (void)loader_noted;
+    if (name.empty()) {
+        note_proc(who, device, name, "empty name", 0);
+        return 0;
+    }
     static const bool note_all = std::getenv("NX_NVN_REAL") != nullptr;  // record every proc's driver address
     if (note_all) nvn::real_proc(c, name.c_str());
-    if (hle_lookup(name.c_str())) return hle_address(name.c_str());
-    if (driver_serves(name))
-        if (uint64_t real = nvn::real_proc(c, name.c_str())) return real;
-    return hle_address_or(name.c_str(), trace_stub);
+    uint64_t addr = 0;
+    const char* how = "";
+    if (hle_lookup(name.c_str())) {
+        addr = hle_address(name.c_str());
+        how = "host implementation";
+    } else {
+        if (driver_serves(name)) {
+            // Logged BEFORE the call: the loader is guest code, and a crash inside it would otherwise leave no trace
+            // of which name it was asked for.
+            static std::mutex asked_lock;
+            static std::set<std::string> asked;
+            bool first;
+            {
+                std::lock_guard lk(asked_lock);
+                first = asked.insert(name).second;
+            }
+            if (first) log("nvn: asking the driver's loader for %s", name.c_str());
+            if (uint64_t real = nvn::real_proc(c, name.c_str())) {
+                addr = real;
+                how = "the driver's own proc";
+            }
+        }
+        // No driver proc (an SDK 2017 game, or NX_NVN_NO_DRIVER=1): the host's own version, if there is one.
+        if (!addr) {
+            if (uint64_t host = host_builder_proc(name)) {
+                addr = host;
+                how = "host builder (no driver proc)";
+            }
+        }
+    }
+    if (!addr) {
+        addr = hle_address_or(name.c_str(), trace_stub);
+        how = driver_serves(name) ? "trace stub (the driver has no such proc, no host version)"
+                                  : "trace stub (not implemented)";
+    }
+    note_proc(who, device, name, how, addr);
+    return addr;
 }
 
 // PFNNVNGENERICFUNCPROC nvnBootstrapLoader(const char* name)
@@ -102,14 +232,14 @@ void nvn_bootstrap_loader(CPU& c) {
         std::lock_guard lk(g_lock);
         write_line(("# nvnBootstrapLoader(" + name + ")").c_str());
     }
-    c.x[0] = proc_address(c, name);
+    c.x[0] = proc_address(c, name, "nvnBootstrapLoader", 0);
 }
 
 // PFNNVNGENERICFUNCPROC nvnDeviceGetProcAddress(const NVNdevice* device, const char* name)
 void nvn_device_get_proc_address(CPU& c) {
     std::string name = guest_str(c.x[1]);
     if (g_trace) log("nvnDeviceGetProcAddress(%llx, %s)", (unsigned long long)c.x[0], name.c_str());
-    c.x[0] = proc_address(c, name);
+    c.x[0] = proc_address(c, name, "nvnDeviceGetProcAddress", c.x[0]);
 }
 
 }  // namespace
@@ -117,7 +247,27 @@ void nvn_device_get_proc_address(CPU& c) {
 NX_HLE("nvnBootstrapLoader", nvn_bootstrap_loader);
 NX_HLE("nvnDeviceGetProcAddress", nvn_device_get_proc_address);
 
+// Host versions of builder procs, used when the SDK's driver has none (see proc_address).
+NX_HLE("host_nvnMemoryPoolBuilderSetDefaults", host_pool_builder_set_defaults);
+NX_HLE("host_nvnMemoryPoolBuilderSetDevice", host_pool_builder_set_device);
+NX_HLE("host_nvnMemoryPoolBuilderSetFlags", host_pool_builder_set_flags);
+NX_HLE("host_nvnMemoryPoolBuilderSetStorage", host_pool_builder_set_storage);
+NX_HLE("host_nvnMemoryPoolBuilderGetDevice", host_pool_builder_get_device);
+NX_HLE("host_nvnMemoryPoolBuilderGetMemory", host_pool_builder_get_memory);
+NX_HLE("host_nvnMemoryPoolBuilderGetSize", host_pool_builder_get_size);
+NX_HLE("host_nvnMemoryPoolBuilderGetFlags", host_pool_builder_get_flags);
+
 namespace nvn {
+
+// What the game stored in a memory pool builder through the host procs above (nvnMemoryPoolInitialize reads the
+// builder with this: declare it in nvn.h). False when the builder was not built by the host procs (the driver's own
+// layout, which its getters read).
+bool host_pool_builder(uint64_t builder, uint64_t& device, uint64_t& memory, uint64_t& size, uint32_t& flags) {
+    const auto* b = reinterpret_cast<const HostPoolBuilder*>(builder);
+    if (!b || b->magic != kPoolBuilderMagic) return false;
+    device = b->device, memory = b->memory, size = b->size, flags = b->flags;
+    return true;
+}
 
 uint64_t guest_call(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args) {
     uint64_t saved[31];
