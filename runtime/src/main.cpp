@@ -74,9 +74,9 @@ static void call_preserving(CPU& c, uint64_t target) {
 // DT_INIT loads the word where it keeps __nnmusl_init_dso's result with `adrp xN, page` ... `ldr w8, [xN, #off]`
 // in its first instructions (SDK 9: adjacent; SDK 16: another adrp in between). Follow the adrp targets until
 // that load.
-static uint64_t init_status_addr(const ModuleInfo& m) {
+static uint64_t init_status_addr(const ModuleInfo& m, uint64_t start, bool must = true) {
     uint64_t page[32] = {};
-    for (uint64_t pc = m.base + kDtInit; pc < m.base + kDtInit + 0x40; pc += 4) {
+    for (uint64_t pc = start; pc < start + 0x40; pc += 4) {
         uint32_t w = ld<uint32_t>(pc);
         if ((w & 0x9F000000) == 0x90000000) {  // adrp
             int64_t imm = int64_t(((w >> 5) & 0x7FFFF) << 2 | ((w >> 29) & 3)) << 43 >> 31;  // sign-extended << 12
@@ -85,7 +85,8 @@ static uint64_t init_status_addr(const ModuleInfo& m) {
             return page[(w >> 5) & 31] + ((w >> 10) & 0xFFF) * 4;
         }
     }
-    fatal("%s: DT_INIT does not load its init status as expected", m.name);
+    if (must) fatal("%s: DT_INIT does not load its init status as expected", m.name);
+    return 0;
 }
 
 // DT_INIT hands __nnmusl_init_dso the module's layout: consecutive GOT slots it loads with adrp + ldr. Slots 13
@@ -108,39 +109,93 @@ static bool tdata_range(const ModuleInfo& m, uint64_t& start, uint64_t& end) {
     return start <= end && end - start <= 0x1000 && start >= m.base && end <= m.base + 0x10000000;
 }
 
-// A module's DT_INIT word is usable when it is not an all-zero or all-one word: 0x0000xxxx is the permanently
-// undefined UDF encoding and 0xFFFFFFFF an erased word, both of which fault when executed.
+static uint64_t module_symbol(const ModuleInfo& m, const char* name);
+
+// Where the module's DT_INIT code starts. SDK 9 and 16 modules have it at +0x30; an SDK 2017 module has its `_init`
+// at +0x24 (the log's symbol list: _init at base+24), so +0x30 lands in the middle of its prologue and the call goes
+// astray (pc 0). The module's own `_init` symbol wins, +0x30 is the fallback.
+static uint64_t dt_init_addr(const ModuleInfo& m, bool* from_symbol) {
+    const uint64_t sym = module_symbol(m, "_init");
+    if (from_symbol) *from_symbol = sym != 0;
+    return sym ? sym : m.base + kDtInit;
+}
+
+// A DT_INIT word is usable when it is not an all-zero or all-one word: 0x0000xxxx is the permanently undefined UDF
+// encoding and 0xFFFFFFFF an erased word, both of which fault when executed.
 static bool dt_init_usable(uint32_t word) { return (word >> 16) != 0 && word != 0xFFFFFFFFu; }
 
-static void init_module(CPU& c, const ModuleInfo& m) {
-    const uint32_t dt_init = ld<uint32_t>(m.base + kDtInit);
-    log("init_module %s: DT_INIT at %llx = %08x, init_array %p with %zu entries", m.name,
-        (unsigned long long)(m.base + kDtInit), dt_init, (const void*)m.init_array, size_t(m.init_count));
-    if (!dt_init_usable(dt_init)) {
-        // An SDK 2017 module may have no DT_INIT here, or its work was done by nninitInitializeSdkModule: nothing to
-        // run, and the constructors are only run on request (NX_FORCE_CTORS=1), as they may already have run.
-        log("init_module %s: DT_INIT is %08x, not code: skipped", m.name, dt_init);
-        const char* force = std::getenv("NX_FORCE_CTORS");
-        if (force && force[0] == '1' && m.init_array) {
-            for (size_t k = 0; k < m.init_count; k++) call_preserving(c, m.base + m.init_array[k]);
-            log("init_module %s: %zu constructors run (NX_FORCE_CTORS=1)", m.name, size_t(m.init_count));
+// True when the init_array entry's own code calls (or tail-jumps to) `target` within its first instructions: a static
+// initializer that constructs one global object. Used to leave out the entry that builds the OS resource manager, which
+// run_pre_init already constructed (running it again would wipe what nninitStartup has set up in it).
+static bool entry_calls(uint64_t entry, uint64_t target) {
+    if (!target) return false;
+    for (int i = 0; i < 24; i++) {
+        const uint64_t pc = entry + 4 * uint64_t(i);
+        const uint32_t w = ld<uint32_t>(pc);
+        if ((w & 0x7C000000) == 0x14000000) {  // b / bl
+            const int64_t off = int64_t(int32_t(w << 6) >> 6) * 4;
+            if (pc + uint64_t(off) == target) return true;
         }
+        if (w == 0xD65F03C0) break;  // ret
+    }
+    return false;
+}
+
+static void run_init_array(CPU& c, const ModuleInfo& m) {
+    if (!m.init_array) {
+        if (m.init_count) log("init_module %s: init_array is null but has %zu entries: constructors skipped", m.name, size_t(m.init_count));
         return;
     }
-    log("init_module %s: calling DT_INIT", m.name);
-    call_preserving(c, m.base + kDtInit);
-    log("init_module %s: DT_INIT returned", m.name);
-    uint32_t status = ld<uint32_t>(init_status_addr(m));
-    log("init_module %s: init status %u", m.name, status);
-    if (status == 1) {
-        if (!m.init_array && m.init_count) {
-            log("init_module %s: init_array is null but has %zu entries: constructors skipped", m.name,
-                size_t(m.init_count));
-            return;
+    const uint64_t os_ctor = module_symbol(m, "_ZN2nn2os6detail17OsResourceManagerC2Ev");
+    size_t ran = 0, left_out = 0;
+    for (size_t k = 0; k < m.init_count; k++) {
+        const uint64_t entry = m.base + m.init_array[k];
+        if (entry_calls(entry, os_ctor)) {
+            log("init_module %s: init_array[%zu] at %s builds the OS resource manager, already constructed: left out", m.name,
+                k, describe(entry).c_str());
+            left_out++;
+            continue;
         }
-        for (size_t k = 0; k < m.init_count; k++) call_preserving(c, m.base + m.init_array[k]);
+        call_preserving(c, entry);
+        ran++;
     }
-    log("%s constructors: %zu", m.name, status == 1 ? size_t(m.init_count) : size_t(0));
+    log("init_module %s: %zu constructors run, %zu left out", m.name, ran, left_out);
+}
+
+static void init_module(CPU& c, const ModuleInfo& m) {
+    bool from_symbol = false;
+    const uint64_t dt_init_at = dt_init_addr(m, &from_symbol);
+    const uint32_t dt_init = ld<uint32_t>(dt_init_at);
+    log("init_module %s: DT_INIT at %llx (%s) = %08x, init_array %p with %zu entries", m.name,
+        (unsigned long long)dt_init_at, from_symbol ? "the _init symbol" : "default +0x30", dt_init,
+        (const void*)m.init_array, size_t(m.init_count));
+    const char* skip = std::getenv("NX_SKIP_DT_INIT");
+    const bool skip_dt_init = skip && skip[0] == '1';
+    if (skip_dt_init || !dt_init_usable(dt_init)) {
+        // NX_SKIP_DT_INIT=1, or no code there: DT_INIT is not called, so the libc registration it does is not done
+        // and no status can be read. The constructors are run directly only when asked (NX_FORCE_CTORS=1), as
+        // nninitInitializeSdkModule may already have run them.
+        log("init_module %s: DT_INIT skipped (%s)", m.name, skip_dt_init ? "NX_SKIP_DT_INIT=1" : "not code");
+        const char* force = std::getenv("NX_FORCE_CTORS");
+        if (skip_dt_init || (force && force[0] == '1')) run_init_array(c, m);
+        return;
+    }
+    // DT_INIT keeps the result of its registration in a status word; read it from the code (no call needed). A
+    // nonzero word means DT_INIT already ran (nninitInitializeSdkModule can do it): it is not called a second time.
+    const uint64_t status_at = init_status_addr(m, dt_init_at, false);
+    const uint32_t before = status_at ? ld<uint32_t>(status_at) : 0;
+    log("init_module %s: init status word at %llx = %u before DT_INIT", m.name, (unsigned long long)status_at, before);
+    if (before == 0) {
+        log("init_module %s: calling DT_INIT at %s", m.name, describe(dt_init_at).c_str());
+        call_preserving(c, dt_init_at);
+        log("init_module %s: DT_INIT returned", m.name);
+    } else {
+        log("init_module %s: DT_INIT already ran: not called again", m.name);
+    }
+    const uint32_t status = ld<uint32_t>(init_status_addr(m, dt_init_at));
+    log("init_module %s: init status %u", m.name, status);
+    if (status == 1) run_init_array(c, m);
+    else log("%s constructors: 0 (status %u)", m.name, status);
 }
 
 static void rtld_init(CPU&) {}
