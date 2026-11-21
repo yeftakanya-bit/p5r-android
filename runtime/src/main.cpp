@@ -120,6 +120,42 @@ static void rtld_init(CPU&) {}
 static void rtld_fini(CPU&) {}
 static void rtld_mark(CPU&) {}
 
+// The address of a symbol the module itself defines (not an import), or 0.
+static uint64_t module_symbol(const ModuleInfo& m, const char* name) {
+    for (size_t k = 0; k < m.symbol_count; k++)
+        if (!m.symbols[k].imported && m.symbols[k].name && std::string(m.symbols[k].name) == name)
+            return m.base + m.symbols[k].value;
+    return 0;
+}
+
+// For a game whose nn::init::Start cannot be found: the first `limit` symbols the module defines, then every defined
+// symbol whose name looks like a start function (Start, start, nnMain, nninit, _init), so the real name shows in nx.log.
+static void log_symbols(const ModuleInfo& m, const char* label, size_t limit) {
+    size_t defined = 0;
+    for (size_t k = 0; k < m.symbol_count; k++)
+        if (!m.symbols[k].imported) defined++;
+    log("symbols of %s: %zu in total, %zu defined, base %llx", label, size_t(m.symbol_count), defined,
+        (unsigned long long)m.base);
+    size_t shown = 0;
+    for (size_t k = 0; k < m.symbol_count && shown < limit; k++) {
+        if (m.symbols[k].imported) continue;
+        log("  %s[%zu] %s at %llx", label, shown, m.symbols[k].name ? m.symbols[k].name : "(no name)",
+            (unsigned long long)(m.base + m.symbols[k].value));
+        shown++;
+    }
+    size_t hits = 0;
+    for (size_t k = 0; k < m.symbol_count && hits < 20; k++) {
+        if (m.symbols[k].imported || !m.symbols[k].name) continue;
+        const std::string n = m.symbols[k].name;
+        if (n.find("Start") == std::string::npos && n.find("start") == std::string::npos &&
+            n.find("nnMain") == std::string::npos && n.find("nninit") == std::string::npos &&
+            n.find("_init") == std::string::npos)
+            continue;
+        log("  %s start-like: %s at %llx", label, n.c_str(), (unsigned long long)(m.base + m.symbols[k].value));
+        hits++;
+    }
+}
+
 // nnMain, as called by nn::init::Start: the constructors need the program's allocator, which nninitStartup has
 // set up by now, so they run here, right before the real nnMain.
 static void nn_main(CPU& c) {
@@ -127,10 +163,8 @@ static void nn_main(CPU& c) {
     init_module(c, *g_main);
     game::after_init();
     log("entering nnMain");
-    uint64_t real = 0;
-    for (size_t k = 0; k < g_main->symbol_count; k++)
-        if (!g_main->symbols[k].imported && std::string(g_main->symbols[k].name) == "nnMain")
-            real = g_main->base + g_main->symbols[k].value;
+    const uint64_t real = module_symbol(*g_main, "nnMain");
+    if (!real) fatal("nnMain not found in the main module");
     call(c, real);
 }
 
@@ -283,10 +317,47 @@ void boot() {
         c.x[3] = hle_address("__rtld_init");
         c.x[4] = hle_address("__rtld_fini");
     } else {
-        fatal("nn::init::Start not found");
+        log("nn::init::Start not found (neither the SDK 9 nor the SDK 16 signature): looking for another way in");
+        log_symbols(*g_sdk, "sdk", 20);
+        log_symbols(*g_main, "main", 20);
+        c.x[30] = hle_address("__process_return");
+        // Fallback 1: the game's own nnMain. Its allocator and TLS setup is nninitStartup (when the game has one), so
+        // that runs first; then nn_main initializes the modules and calls nnMain, as nn::init::Start would have.
+        // This skips whatever else the SDK's Start does (nn::os and nn::diag setup).
+        const uint64_t real_main = module_symbol(*g_main, "nnMain");
+        if (real_main) {
+            const uint64_t startup = module_symbol(*g_main, "nninitStartup");
+            log("fallback 1: nnMain at %s, nninitStartup %s", describe(real_main).c_str(),
+                startup ? describe(startup).c_str() : "not found (skipped)");
+            if (startup) {
+                CPU& sc = current_cpu();
+                sc.x[30] = hle_address("__process_return");
+                call(sc, startup);
+                log("nninitStartup returned");
+            }
+            CPU& mc = current_cpu();
+            mc.x[0] = main_thread;
+            mc.x[30] = hle_address("__process_return");
+            nn_main(mc);
+            log("returned from nnMain");
+            plat::exit_process(0);
+            return;
+        }
+        // Fallback 2 (last resort, experimental): no nnMain symbol (stripped). Jump to the start of a module image:
+        // the main module's by default, the sdk's with NX_ENTRY=sdk. The first instruction of a module's text is the
+        // branch to its entry. The symbol lists above are what to read to find the real start function.
+        const char* pick = std::getenv("NX_ENTRY");
+        const bool use_sdk = pick && std::string(pick) == "sdk";
+        const ModuleInfo& entry_mod = use_sdk ? *g_sdk : *g_main;
+        start = entry_mod.base;
+        c.x[2] = hle_address("__rtld_init");
+        c.x[3] = hle_address("__rtld_fini");
+        log("fallback 2: no nnMain either; entering the %s module image at %s (set NX_ENTRY=%s to try the other)",
+            use_sdk ? "sdk" : "main", describe(start).c_str(), use_sdk ? "main" : "sdk");
     }
     c.x[30] = hle_address("__process_return");
-    log("entering nn::init::Start at %s", describe(start).c_str());
+    log("entering %s at %s", start == g_main->base || start == g_sdk->base ? "the module entry" : "nn::init::Start",
+        describe(start).c_str());
     call(c, start);
     log("returned from nn::init::Start");
 }
