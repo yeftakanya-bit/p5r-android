@@ -819,6 +819,11 @@ void crash(int sig, siginfo_t* info, void* uc) {
         for (int k = 0; k < 32; k += 4)
             nx::log("  x%-2d %016llx %016llx %016llx %016llx", k, (unsigned long long)c.x[k],
                     (unsigned long long)c.x[k + 1], (unsigned long long)c.x[k + 2], (unsigned long long)c.x[k + 3]);
+        // Registers that hold the address of a host (HLE) function: x8 = 4400000a50 names the call being made.
+        for (int k = 0; k < 31; k++) {
+            const std::string d = nx::describe(c.x[k]);
+            if (d.compare(0, 4, "hle:") == 0) nx::log("  x%d = %llx is %s", k, (unsigned long long)c.x[k], d.c_str());
+        }
         nx::backtrace(c);
         nx::log_recent_files();
         nx::nvn::log_recent_passes();
