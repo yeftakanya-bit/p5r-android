@@ -21,11 +21,17 @@
 #include <regex>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 #include "nvn.h"
 #include "platform.h"
 
 namespace nx {
+
+namespace nvn {
+// The SDK driver's own proc for a name (its loader, recompiled in sdk): 0 when the sdk has no driver.
+uint64_t driver_proc(CPU& c, const char* name);
+}  // namespace nvn
 
 namespace {
 
@@ -150,10 +156,644 @@ void host_pool_builder_get_flags(CPU& c) {
     c.x[0] = b ? b->flags : 0;
 }
 
-// The host's version of a builder proc, registered below as "host_<nvn name>"; 0 when there is none.
-uint64_t host_builder_proc(const std::string& name) {
-    const std::string host = "host_" + name;
-    return hle_lookup(host.c_str()) ? hle_address(host.c_str()) : 0;
+// ---- host builders: every other builder, kept in a side table keyed by the builder's address ---------------------
+// The builders are opaque structs only these procs touch, so the host keeps its own copy of the fields; a side table
+// (not the builder's bytes) because the real sizes of the structs differ by builder and version. SetDefaults clears an
+// entry. The values marked "assumed" are NVN defaults this code has not checked against a driver.
+struct BuilderData {
+    uint64_t f[16];
+};
+std::mutex g_bd_lock;
+std::unordered_map<uint64_t, BuilderData> g_bd;
+
+BuilderData* bd(uint64_t builder) { return builder ? &g_bd[builder] : nullptr; }  // g_bd_lock held
+
+uint32_t bits_of(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return u;
+}
+float float_of(uint64_t u) {
+    uint32_t v = uint32_t(u);
+    float f;
+    std::memcpy(&f, &v, 4);
+    return f;
+}
+void put32(uint64_t addr, uint32_t v) {
+    if (addr) std::memcpy(reinterpret_cast<void*>(addr), &v, 4);
+}
+
+// Queue builder defaults (assumed): command, compute and control memory, and the flush threshold.
+constexpr uint64_t kQueueCommandMemory = 0x40000;
+constexpr uint64_t kQueueComputeMemory = 0x40000;
+constexpr uint64_t kQueueControlMemory = 0x1000;
+constexpr uint64_t kQueueFlushThreshold = 0x2000;
+
+void hb_DeviceBuilderSetDefaults(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    std::memset(d, 0, sizeof *d);
+}
+
+void hb_DeviceBuilderSetFlags(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[1] = uint32_t(c.x[1]);
+}
+
+void hb_QueueBuilderSetDefaults(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    std::memset(d, 0, sizeof *d);
+    d->f[2] = kQueueCommandMemory;
+    d->f[3] = kQueueComputeMemory;
+    d->f[4] = kQueueControlMemory;
+    d->f[5] = kQueueFlushThreshold;
+}
+
+void hb_QueueBuilderSetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[0] = c.x[1];
+}
+
+void hb_QueueBuilderSetFlags(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[1] = uint32_t(c.x[1]);
+}
+
+void hb_QueueBuilderSetCommandMemorySize(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[2] = c.x[1];
+}
+
+void hb_QueueBuilderSetComputeMemorySize(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[3] = c.x[1];
+}
+
+void hb_QueueBuilderSetControlMemorySize(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[4] = c.x[1];
+}
+
+void hb_QueueBuilderSetCommandFlushThreshold(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[5] = c.x[1];
+}
+
+void hb_QueueBuilderSetQueueMemory(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[6] = c.x[1], d->f[7] = c.x[2];
+}
+
+void hb_QueueBuilderGetQueueMemorySize(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    const uint64_t sum = d ? d->f[2] + d->f[3] + d->f[4] : 0;
+    c.x[0] = (sum + 0xfff) & ~uint64_t(0xfff);
+}
+
+void hb_WindowBuilderSetDefaults(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    std::memset(d, 0, sizeof *d);
+    d->f[4] = 1;  // present interval
+}
+
+void hb_WindowBuilderSetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[0] = c.x[1];
+}
+
+void hb_WindowBuilderSetNativeWindow(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[1] = c.x[1];
+}
+
+void hb_WindowBuilderSetTextures(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[3] = uint32_t(c.x[1]), d->f[2] = c.x[2];
+}
+
+void hb_WindowBuilderSetPresentInterval(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[4] = uint32_t(c.x[1]);
+}
+
+void hb_WindowBuilderGetNativeWindow(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[1] : 0;
+}
+
+void hb_WindowBuilderGetPresentInterval(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[4] : 0;
+}
+
+void hb_BufferBuilderSetDefaults(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    std::memset(d, 0, sizeof *d);
+}
+
+void hb_BufferBuilderSetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[0] = c.x[1];
+}
+
+void hb_BufferBuilderSetStorage(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[1] = c.x[1], d->f[2] = c.x[2], d->f[3] = c.x[3];
+}
+
+void hb_BufferBuilderGetMemoryPool(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[1] : 0;
+}
+
+void hb_BufferBuilderGetMemoryOffset(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[2] : 0;
+}
+
+void hb_BufferBuilderGetSize(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[3] : 0;
+}
+
+void hb_SamplerBuilderSetDefaults(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    std::memset(d, 0, sizeof *d);
+    d->f[7] = bits_of(1000.0f);  // lod clamp max
+    d->f[11] = bits_of(1.0f);    // max anisotropy
+}
+
+void hb_SamplerBuilderSetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[0] = c.x[1];
+}
+
+void hb_SamplerBuilderSetMinMagFilter(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[1] = uint32_t(c.x[1]), d->f[2] = uint32_t(c.x[2]);
+}
+
+void hb_SamplerBuilderSetWrapMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[3] = uint32_t(c.x[1]), d->f[4] = uint32_t(c.x[2]), d->f[5] = uint32_t(c.x[3]);
+}
+
+void hb_SamplerBuilderSetLodClamp(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[6] = bits_of(c.v[0].f32[0]), d->f[7] = bits_of(c.v[1].f32[0]);
+}
+
+void hb_SamplerBuilderSetLodBias(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[8] = bits_of(c.v[0].f32[0]);
+}
+
+void hb_SamplerBuilderSetCompare(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[9] = uint32_t(c.x[1]), d->f[10] = uint32_t(c.x[2]);
+}
+
+void hb_SamplerBuilderSetBorderColor(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !c.x[1]) return;
+    std::memcpy(&d->f[13], reinterpret_cast<const void*>(c.x[1]), 16);  // the 4 components, raw
+}
+
+void hb_SamplerBuilderGetBorderColor(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !c.x[1]) return;
+    std::memcpy(reinterpret_cast<void*>(c.x[1]), &d->f[13], 16);
+}
+
+void hb_SamplerBuilderSetBorderColori(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !c.x[1]) return;
+    std::memcpy(&d->f[13], reinterpret_cast<const void*>(c.x[1]), 16);  // the 4 components, raw
+}
+
+void hb_SamplerBuilderGetBorderColori(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !c.x[1]) return;
+    std::memcpy(reinterpret_cast<void*>(c.x[1]), &d->f[13], 16);
+}
+
+void hb_SamplerBuilderSetBorderColorui(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !c.x[1]) return;
+    std::memcpy(&d->f[13], reinterpret_cast<const void*>(c.x[1]), 16);  // the 4 components, raw
+}
+
+void hb_SamplerBuilderGetBorderColorui(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !c.x[1]) return;
+    std::memcpy(reinterpret_cast<void*>(c.x[1]), &d->f[13], 16);
+}
+
+void hb_SamplerBuilderSetMaxAnisotropy(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[11] = bits_of(c.v[0].f32[0]);
+}
+
+void hb_SamplerBuilderSetReductionFilter(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[12] = uint32_t(c.x[1]);
+}
+
+void hb_SamplerBuilderGetMinMagFilter(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) put32(c.x[1], uint32_t(d->f[1])), put32(c.x[2], uint32_t(d->f[2]));
+}
+
+void hb_SamplerBuilderGetWrapMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) put32(c.x[1], uint32_t(d->f[3])), put32(c.x[2], uint32_t(d->f[4])), put32(c.x[3], uint32_t(d->f[5]));
+}
+
+void hb_SamplerBuilderGetLodClamp(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) put32(c.x[1], uint32_t(d->f[6])), put32(c.x[2], uint32_t(d->f[7]));
+}
+
+void hb_SamplerBuilderGetLodBias(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.v[0].f32[0] = d ? float_of(d->f[8]) : 0.0f;
+}
+
+void hb_SamplerBuilderGetCompare(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) put32(c.x[1], uint32_t(d->f[9])), put32(c.x[2], uint32_t(d->f[10]));
+}
+
+void hb_SamplerBuilderGetMaxAnisotropy(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.v[0].f32[0] = d ? float_of(d->f[11]) : 1.0f;
+}
+
+void hb_SamplerBuilderGetReductionFilter(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[12] : 0;
+}
+
+void hb_TextureBuilderSetDefaults(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    std::memset(d, 0, sizeof *d);
+    d->f[4] = 1;  // height
+    d->f[5] = 1;  // depth
+    d->f[6] = 1;  // levels
+}
+
+void hb_TextureBuilderSetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[0] = c.x[1];
+}
+
+void hb_TextureBuilderSetFlags(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[1] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetTarget(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[2] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetWidth(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[3] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetHeight(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[4] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetDepth(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[5] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetSize1D(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[3] = uint32_t(c.x[1]), d->f[4] = 1, d->f[5] = 1;
+}
+
+void hb_TextureBuilderSetSize2D(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[3] = uint32_t(c.x[1]), d->f[4] = uint32_t(c.x[2]), d->f[5] = 1;
+}
+
+void hb_TextureBuilderSetSize3D(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[3] = uint32_t(c.x[1]), d->f[4] = uint32_t(c.x[2]), d->f[5] = uint32_t(c.x[3]);
+}
+
+void hb_TextureBuilderSetLevels(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[6] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetFormat(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[7] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetSamples(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[8] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetSwizzle(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0]))
+        d->f[9] = (c.x[1] & 0xff) | (c.x[2] & 0xff) << 8 | (c.x[3] & 0xff) << 16 | (c.x[4] & 0xff) << 24;
+}
+
+void hb_TextureBuilderSetDepthStencilMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[10] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetStorage(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[13] = c.x[1], d->f[14] = c.x[2];
+}
+
+void hb_TextureBuilderSetStride(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[11] = c.x[1];
+}
+
+void hb_TextureBuilderSetGLTextureName(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[12] = uint32_t(c.x[1]);
+}
+
+void hb_TextureBuilderSetPackagedTextureData(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[15] = c.x[1];
+}
+
+void hb_TextureBuilderSetPackagedTextureLayout(CPU& c) {
+    (void)c;  // the layout is not kept: nothing reads it back yet
+}
+
+void hb_TextureBuilderGetFlags(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[1] : 0;
+}
+
+void hb_TextureBuilderGetTarget(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[2] : 0;
+}
+
+void hb_TextureBuilderGetWidth(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[3] : 0;
+}
+
+void hb_TextureBuilderGetHeight(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[4] : 0;
+}
+
+void hb_TextureBuilderGetDepth(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[5] : 0;
+}
+
+void hb_TextureBuilderGetLevels(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[6] : 0;
+}
+
+void hb_TextureBuilderGetFormat(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[7] : 0;
+}
+
+void hb_TextureBuilderGetSamples(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[8] : 0;
+}
+
+void hb_TextureBuilderGetDepthStencilMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[10] : 0;
+}
+
+void hb_TextureBuilderGetStride(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[11] : 0;
+}
+
+void hb_TextureBuilderGetGLTextureName(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[12] : 0;
+}
+
+void hb_TextureBuilderGetMemoryPool(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[13] : 0;
+}
+
+void hb_TextureBuilderGetMemoryOffset(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[14] : 0;
+}
+
+void hb_TextureBuilderGetPackagedTextureData(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[15] : 0;
+}
+
+void hb_TextureBuilderGetSwizzle(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    put32(c.x[1], uint32_t(d->f[9] & 0xff));
+    put32(c.x[2], uint32_t(d->f[9] >> 8 & 0xff));
+    put32(c.x[3], uint32_t(d->f[9] >> 16 & 0xff));
+    put32(c.x[4], uint32_t(d->f[9] >> 24 & 0xff));
+}
+
+using HostFn = void (*)(CPU&);
+struct HostProc {
+    const char* name;
+    HostFn fn;
+};
+
+// Every proc the host implements for the builders, by NVN name (each is also registered as "host_<name>" below).
+const HostProc kHostBuilderProcs[] = {
+    {"nvnMemoryPoolBuilderSetDefaults", host_pool_builder_set_defaults},
+    {"nvnMemoryPoolBuilderSetDevice", host_pool_builder_set_device},
+    {"nvnMemoryPoolBuilderSetFlags", host_pool_builder_set_flags},
+    {"nvnMemoryPoolBuilderSetStorage", host_pool_builder_set_storage},
+    {"nvnMemoryPoolBuilderGetDevice", host_pool_builder_get_device},
+    {"nvnMemoryPoolBuilderGetMemory", host_pool_builder_get_memory},
+    {"nvnMemoryPoolBuilderGetSize", host_pool_builder_get_size},
+    {"nvnMemoryPoolBuilderGetFlags", host_pool_builder_get_flags},
+    {"nvnDeviceBuilderSetDefaults", hb_DeviceBuilderSetDefaults},
+    {"nvnDeviceBuilderSetFlags", hb_DeviceBuilderSetFlags},
+    {"nvnQueueBuilderSetDefaults", hb_QueueBuilderSetDefaults},
+    {"nvnQueueBuilderSetDevice", hb_QueueBuilderSetDevice},
+    {"nvnQueueBuilderSetFlags", hb_QueueBuilderSetFlags},
+    {"nvnQueueBuilderSetCommandMemorySize", hb_QueueBuilderSetCommandMemorySize},
+    {"nvnQueueBuilderSetComputeMemorySize", hb_QueueBuilderSetComputeMemorySize},
+    {"nvnQueueBuilderSetControlMemorySize", hb_QueueBuilderSetControlMemorySize},
+    {"nvnQueueBuilderSetCommandFlushThreshold", hb_QueueBuilderSetCommandFlushThreshold},
+    {"nvnQueueBuilderSetQueueMemory", hb_QueueBuilderSetQueueMemory},
+    {"nvnQueueBuilderGetQueueMemorySize", hb_QueueBuilderGetQueueMemorySize},
+    {"nvnWindowBuilderSetDefaults", hb_WindowBuilderSetDefaults},
+    {"nvnWindowBuilderSetDevice", hb_WindowBuilderSetDevice},
+    {"nvnWindowBuilderSetNativeWindow", hb_WindowBuilderSetNativeWindow},
+    {"nvnWindowBuilderSetTextures", hb_WindowBuilderSetTextures},
+    {"nvnWindowBuilderSetPresentInterval", hb_WindowBuilderSetPresentInterval},
+    {"nvnWindowBuilderGetNativeWindow", hb_WindowBuilderGetNativeWindow},
+    {"nvnWindowBuilderGetPresentInterval", hb_WindowBuilderGetPresentInterval},
+    {"nvnBufferBuilderSetDefaults", hb_BufferBuilderSetDefaults},
+    {"nvnBufferBuilderSetDevice", hb_BufferBuilderSetDevice},
+    {"nvnBufferBuilderSetStorage", hb_BufferBuilderSetStorage},
+    {"nvnBufferBuilderGetMemoryPool", hb_BufferBuilderGetMemoryPool},
+    {"nvnBufferBuilderGetMemoryOffset", hb_BufferBuilderGetMemoryOffset},
+    {"nvnBufferBuilderGetSize", hb_BufferBuilderGetSize},
+    {"nvnSamplerBuilderSetDefaults", hb_SamplerBuilderSetDefaults},
+    {"nvnSamplerBuilderSetDevice", hb_SamplerBuilderSetDevice},
+    {"nvnSamplerBuilderSetMinMagFilter", hb_SamplerBuilderSetMinMagFilter},
+    {"nvnSamplerBuilderSetWrapMode", hb_SamplerBuilderSetWrapMode},
+    {"nvnSamplerBuilderSetLodClamp", hb_SamplerBuilderSetLodClamp},
+    {"nvnSamplerBuilderSetLodBias", hb_SamplerBuilderSetLodBias},
+    {"nvnSamplerBuilderSetCompare", hb_SamplerBuilderSetCompare},
+    {"nvnSamplerBuilderSetBorderColor", hb_SamplerBuilderSetBorderColor},
+    {"nvnSamplerBuilderGetBorderColor", hb_SamplerBuilderGetBorderColor},
+    {"nvnSamplerBuilderSetBorderColori", hb_SamplerBuilderSetBorderColori},
+    {"nvnSamplerBuilderGetBorderColori", hb_SamplerBuilderGetBorderColori},
+    {"nvnSamplerBuilderSetBorderColorui", hb_SamplerBuilderSetBorderColorui},
+    {"nvnSamplerBuilderGetBorderColorui", hb_SamplerBuilderGetBorderColorui},
+    {"nvnSamplerBuilderSetMaxAnisotropy", hb_SamplerBuilderSetMaxAnisotropy},
+    {"nvnSamplerBuilderSetReductionFilter", hb_SamplerBuilderSetReductionFilter},
+    {"nvnSamplerBuilderGetMinMagFilter", hb_SamplerBuilderGetMinMagFilter},
+    {"nvnSamplerBuilderGetWrapMode", hb_SamplerBuilderGetWrapMode},
+    {"nvnSamplerBuilderGetLodClamp", hb_SamplerBuilderGetLodClamp},
+    {"nvnSamplerBuilderGetLodBias", hb_SamplerBuilderGetLodBias},
+    {"nvnSamplerBuilderGetCompare", hb_SamplerBuilderGetCompare},
+    {"nvnSamplerBuilderGetMaxAnisotropy", hb_SamplerBuilderGetMaxAnisotropy},
+    {"nvnSamplerBuilderGetReductionFilter", hb_SamplerBuilderGetReductionFilter},
+    {"nvnTextureBuilderSetDefaults", hb_TextureBuilderSetDefaults},
+    {"nvnTextureBuilderSetDevice", hb_TextureBuilderSetDevice},
+    {"nvnTextureBuilderSetFlags", hb_TextureBuilderSetFlags},
+    {"nvnTextureBuilderSetTarget", hb_TextureBuilderSetTarget},
+    {"nvnTextureBuilderSetWidth", hb_TextureBuilderSetWidth},
+    {"nvnTextureBuilderSetHeight", hb_TextureBuilderSetHeight},
+    {"nvnTextureBuilderSetDepth", hb_TextureBuilderSetDepth},
+    {"nvnTextureBuilderSetSize1D", hb_TextureBuilderSetSize1D},
+    {"nvnTextureBuilderSetSize2D", hb_TextureBuilderSetSize2D},
+    {"nvnTextureBuilderSetSize3D", hb_TextureBuilderSetSize3D},
+    {"nvnTextureBuilderSetLevels", hb_TextureBuilderSetLevels},
+    {"nvnTextureBuilderSetFormat", hb_TextureBuilderSetFormat},
+    {"nvnTextureBuilderSetSamples", hb_TextureBuilderSetSamples},
+    {"nvnTextureBuilderSetSwizzle", hb_TextureBuilderSetSwizzle},
+    {"nvnTextureBuilderSetDepthStencilMode", hb_TextureBuilderSetDepthStencilMode},
+    {"nvnTextureBuilderSetStorage", hb_TextureBuilderSetStorage},
+    {"nvnTextureBuilderSetStride", hb_TextureBuilderSetStride},
+    {"nvnTextureBuilderSetGLTextureName", hb_TextureBuilderSetGLTextureName},
+    {"nvnTextureBuilderSetPackagedTextureData", hb_TextureBuilderSetPackagedTextureData},
+    {"nvnTextureBuilderSetPackagedTextureLayout", hb_TextureBuilderSetPackagedTextureLayout},
+    {"nvnTextureBuilderGetFlags", hb_TextureBuilderGetFlags},
+    {"nvnTextureBuilderGetTarget", hb_TextureBuilderGetTarget},
+    {"nvnTextureBuilderGetWidth", hb_TextureBuilderGetWidth},
+    {"nvnTextureBuilderGetHeight", hb_TextureBuilderGetHeight},
+    {"nvnTextureBuilderGetDepth", hb_TextureBuilderGetDepth},
+    {"nvnTextureBuilderGetLevels", hb_TextureBuilderGetLevels},
+    {"nvnTextureBuilderGetFormat", hb_TextureBuilderGetFormat},
+    {"nvnTextureBuilderGetSamples", hb_TextureBuilderGetSamples},
+    {"nvnTextureBuilderGetDepthStencilMode", hb_TextureBuilderGetDepthStencilMode},
+    {"nvnTextureBuilderGetStride", hb_TextureBuilderGetStride},
+    {"nvnTextureBuilderGetGLTextureName", hb_TextureBuilderGetGLTextureName},
+    {"nvnTextureBuilderGetMemoryPool", hb_TextureBuilderGetMemoryPool},
+    {"nvnTextureBuilderGetMemoryOffset", hb_TextureBuilderGetMemoryOffset},
+    {"nvnTextureBuilderGetPackagedTextureData", hb_TextureBuilderGetPackagedTextureData},
+    {"nvnTextureBuilderGetSwizzle", hb_TextureBuilderGetSwizzle},
+};
+
+std::mutex g_host_lock;
+std::unordered_map<uint64_t, HostFn> g_host_by_address;  // the HLE address handed out -> the function behind it
+
+const HostProc* find_host_proc(const char* name) {
+    static const std::unordered_map<std::string, const HostProc*> by_name = [] {
+        std::unordered_map<std::string, const HostProc*> m;
+        for (const HostProc& p : kHostBuilderProcs) m[p.name] = &p;
+        return m;
+    }();
+    auto it = by_name.find(name);
+    return it == by_name.end() ? nullptr : it->second;
+}
+
+// The host's version of a builder proc as an HLE address (what the game, or a runtime caller, can call); 0 if none.
+uint64_t host_proc_address(const char* name) {
+    const HostProc* p = find_host_proc(name);
+    if (!p) return 0;
+    const std::string host = std::string("host_") + name;
+    if (!hle_lookup(host.c_str())) return 0;
+    const uint64_t addr = hle_address(host.c_str());
+    std::lock_guard lk(g_host_lock);
+    g_host_by_address[addr] = p->fn;
+    return addr;
+}
+
+HostFn host_fn_for(uint64_t addr) {
+    std::lock_guard lk(g_host_lock);
+    auto it = g_host_by_address.find(addr);
+    return it == g_host_by_address.end() ? nullptr : it->second;
+}
+
+uint64_t host_builder_proc(const std::string& name) { return host_proc_address(name.c_str()); }
+
+// What a runtime caller of nvn::real_proc gets for a proc that no driver and no host version serves: a function that
+// stops with the proc's name, instead of a null call that faults at pc 0 with nothing to say which proc it was.
+void missing_driver_proc(CPU& c) {
+    fatal("nvn: %s: this game's sdk has no NVN driver and the host has no version of it yet (lr %s)",
+          hle_current_name(), describe(c.x[30]).c_str());
 }
 
 // One line in nx.log for each name the game asks for (the first time), and for every null answer.
@@ -184,7 +824,7 @@ uint64_t proc_address(CPU& c, const std::string& name, const char* who, uint64_t
         return 0;
     }
     static const bool note_all = std::getenv("NX_NVN_REAL") != nullptr;  // record every proc's driver address
-    if (note_all) nvn::real_proc(c, name.c_str());
+    if (note_all) nvn::driver_proc(c, name.c_str());
     uint64_t addr = 0;
     const char* how = "";
     if (hle_lookup(name.c_str())) {
@@ -202,7 +842,7 @@ uint64_t proc_address(CPU& c, const std::string& name, const char* who, uint64_t
                 first = asked.insert(name).second;
             }
             if (first) log("nvn: asking the driver's loader for %s", name.c_str());
-            if (uint64_t real = nvn::real_proc(c, name.c_str())) {
+            if (uint64_t real = nvn::driver_proc(c, name.c_str())) {
                 addr = real;
                 how = "the driver's own proc";
             }
@@ -256,6 +896,87 @@ NX_HLE("host_nvnMemoryPoolBuilderGetDevice", host_pool_builder_get_device);
 NX_HLE("host_nvnMemoryPoolBuilderGetMemory", host_pool_builder_get_memory);
 NX_HLE("host_nvnMemoryPoolBuilderGetSize", host_pool_builder_get_size);
 NX_HLE("host_nvnMemoryPoolBuilderGetFlags", host_pool_builder_get_flags);
+NX_HLE("host_nvnDeviceBuilderSetDefaults", hb_DeviceBuilderSetDefaults);
+NX_HLE("host_nvnDeviceBuilderSetFlags", hb_DeviceBuilderSetFlags);
+NX_HLE("host_nvnQueueBuilderSetDefaults", hb_QueueBuilderSetDefaults);
+NX_HLE("host_nvnQueueBuilderSetDevice", hb_QueueBuilderSetDevice);
+NX_HLE("host_nvnQueueBuilderSetFlags", hb_QueueBuilderSetFlags);
+NX_HLE("host_nvnQueueBuilderSetCommandMemorySize", hb_QueueBuilderSetCommandMemorySize);
+NX_HLE("host_nvnQueueBuilderSetComputeMemorySize", hb_QueueBuilderSetComputeMemorySize);
+NX_HLE("host_nvnQueueBuilderSetControlMemorySize", hb_QueueBuilderSetControlMemorySize);
+NX_HLE("host_nvnQueueBuilderSetCommandFlushThreshold", hb_QueueBuilderSetCommandFlushThreshold);
+NX_HLE("host_nvnQueueBuilderSetQueueMemory", hb_QueueBuilderSetQueueMemory);
+NX_HLE("host_nvnQueueBuilderGetQueueMemorySize", hb_QueueBuilderGetQueueMemorySize);
+NX_HLE("host_nvnWindowBuilderSetDefaults", hb_WindowBuilderSetDefaults);
+NX_HLE("host_nvnWindowBuilderSetDevice", hb_WindowBuilderSetDevice);
+NX_HLE("host_nvnWindowBuilderSetNativeWindow", hb_WindowBuilderSetNativeWindow);
+NX_HLE("host_nvnWindowBuilderSetTextures", hb_WindowBuilderSetTextures);
+NX_HLE("host_nvnWindowBuilderSetPresentInterval", hb_WindowBuilderSetPresentInterval);
+NX_HLE("host_nvnWindowBuilderGetNativeWindow", hb_WindowBuilderGetNativeWindow);
+NX_HLE("host_nvnWindowBuilderGetPresentInterval", hb_WindowBuilderGetPresentInterval);
+NX_HLE("host_nvnBufferBuilderSetDefaults", hb_BufferBuilderSetDefaults);
+NX_HLE("host_nvnBufferBuilderSetDevice", hb_BufferBuilderSetDevice);
+NX_HLE("host_nvnBufferBuilderSetStorage", hb_BufferBuilderSetStorage);
+NX_HLE("host_nvnBufferBuilderGetMemoryPool", hb_BufferBuilderGetMemoryPool);
+NX_HLE("host_nvnBufferBuilderGetMemoryOffset", hb_BufferBuilderGetMemoryOffset);
+NX_HLE("host_nvnBufferBuilderGetSize", hb_BufferBuilderGetSize);
+NX_HLE("host_nvnSamplerBuilderSetDefaults", hb_SamplerBuilderSetDefaults);
+NX_HLE("host_nvnSamplerBuilderSetDevice", hb_SamplerBuilderSetDevice);
+NX_HLE("host_nvnSamplerBuilderSetMinMagFilter", hb_SamplerBuilderSetMinMagFilter);
+NX_HLE("host_nvnSamplerBuilderSetWrapMode", hb_SamplerBuilderSetWrapMode);
+NX_HLE("host_nvnSamplerBuilderSetLodClamp", hb_SamplerBuilderSetLodClamp);
+NX_HLE("host_nvnSamplerBuilderSetLodBias", hb_SamplerBuilderSetLodBias);
+NX_HLE("host_nvnSamplerBuilderSetCompare", hb_SamplerBuilderSetCompare);
+NX_HLE("host_nvnSamplerBuilderSetBorderColor", hb_SamplerBuilderSetBorderColor);
+NX_HLE("host_nvnSamplerBuilderGetBorderColor", hb_SamplerBuilderGetBorderColor);
+NX_HLE("host_nvnSamplerBuilderSetBorderColori", hb_SamplerBuilderSetBorderColori);
+NX_HLE("host_nvnSamplerBuilderGetBorderColori", hb_SamplerBuilderGetBorderColori);
+NX_HLE("host_nvnSamplerBuilderSetBorderColorui", hb_SamplerBuilderSetBorderColorui);
+NX_HLE("host_nvnSamplerBuilderGetBorderColorui", hb_SamplerBuilderGetBorderColorui);
+NX_HLE("host_nvnSamplerBuilderSetMaxAnisotropy", hb_SamplerBuilderSetMaxAnisotropy);
+NX_HLE("host_nvnSamplerBuilderSetReductionFilter", hb_SamplerBuilderSetReductionFilter);
+NX_HLE("host_nvnSamplerBuilderGetMinMagFilter", hb_SamplerBuilderGetMinMagFilter);
+NX_HLE("host_nvnSamplerBuilderGetWrapMode", hb_SamplerBuilderGetWrapMode);
+NX_HLE("host_nvnSamplerBuilderGetLodClamp", hb_SamplerBuilderGetLodClamp);
+NX_HLE("host_nvnSamplerBuilderGetLodBias", hb_SamplerBuilderGetLodBias);
+NX_HLE("host_nvnSamplerBuilderGetCompare", hb_SamplerBuilderGetCompare);
+NX_HLE("host_nvnSamplerBuilderGetMaxAnisotropy", hb_SamplerBuilderGetMaxAnisotropy);
+NX_HLE("host_nvnSamplerBuilderGetReductionFilter", hb_SamplerBuilderGetReductionFilter);
+NX_HLE("host_nvnTextureBuilderSetDefaults", hb_TextureBuilderSetDefaults);
+NX_HLE("host_nvnTextureBuilderSetDevice", hb_TextureBuilderSetDevice);
+NX_HLE("host_nvnTextureBuilderSetFlags", hb_TextureBuilderSetFlags);
+NX_HLE("host_nvnTextureBuilderSetTarget", hb_TextureBuilderSetTarget);
+NX_HLE("host_nvnTextureBuilderSetWidth", hb_TextureBuilderSetWidth);
+NX_HLE("host_nvnTextureBuilderSetHeight", hb_TextureBuilderSetHeight);
+NX_HLE("host_nvnTextureBuilderSetDepth", hb_TextureBuilderSetDepth);
+NX_HLE("host_nvnTextureBuilderSetSize1D", hb_TextureBuilderSetSize1D);
+NX_HLE("host_nvnTextureBuilderSetSize2D", hb_TextureBuilderSetSize2D);
+NX_HLE("host_nvnTextureBuilderSetSize3D", hb_TextureBuilderSetSize3D);
+NX_HLE("host_nvnTextureBuilderSetLevels", hb_TextureBuilderSetLevels);
+NX_HLE("host_nvnTextureBuilderSetFormat", hb_TextureBuilderSetFormat);
+NX_HLE("host_nvnTextureBuilderSetSamples", hb_TextureBuilderSetSamples);
+NX_HLE("host_nvnTextureBuilderSetSwizzle", hb_TextureBuilderSetSwizzle);
+NX_HLE("host_nvnTextureBuilderSetDepthStencilMode", hb_TextureBuilderSetDepthStencilMode);
+NX_HLE("host_nvnTextureBuilderSetStorage", hb_TextureBuilderSetStorage);
+NX_HLE("host_nvnTextureBuilderSetStride", hb_TextureBuilderSetStride);
+NX_HLE("host_nvnTextureBuilderSetGLTextureName", hb_TextureBuilderSetGLTextureName);
+NX_HLE("host_nvnTextureBuilderSetPackagedTextureData", hb_TextureBuilderSetPackagedTextureData);
+NX_HLE("host_nvnTextureBuilderSetPackagedTextureLayout", hb_TextureBuilderSetPackagedTextureLayout);
+NX_HLE("host_nvnTextureBuilderGetFlags", hb_TextureBuilderGetFlags);
+NX_HLE("host_nvnTextureBuilderGetTarget", hb_TextureBuilderGetTarget);
+NX_HLE("host_nvnTextureBuilderGetWidth", hb_TextureBuilderGetWidth);
+NX_HLE("host_nvnTextureBuilderGetHeight", hb_TextureBuilderGetHeight);
+NX_HLE("host_nvnTextureBuilderGetDepth", hb_TextureBuilderGetDepth);
+NX_HLE("host_nvnTextureBuilderGetLevels", hb_TextureBuilderGetLevels);
+NX_HLE("host_nvnTextureBuilderGetFormat", hb_TextureBuilderGetFormat);
+NX_HLE("host_nvnTextureBuilderGetSamples", hb_TextureBuilderGetSamples);
+NX_HLE("host_nvnTextureBuilderGetDepthStencilMode", hb_TextureBuilderGetDepthStencilMode);
+NX_HLE("host_nvnTextureBuilderGetStride", hb_TextureBuilderGetStride);
+NX_HLE("host_nvnTextureBuilderGetGLTextureName", hb_TextureBuilderGetGLTextureName);
+NX_HLE("host_nvnTextureBuilderGetMemoryPool", hb_TextureBuilderGetMemoryPool);
+NX_HLE("host_nvnTextureBuilderGetMemoryOffset", hb_TextureBuilderGetMemoryOffset);
+NX_HLE("host_nvnTextureBuilderGetPackagedTextureData", hb_TextureBuilderGetPackagedTextureData);
+NX_HLE("host_nvnTextureBuilderGetSwizzle", hb_TextureBuilderGetSwizzle);
 
 namespace nvn {
 
@@ -270,23 +991,31 @@ bool host_pool_builder(uint64_t builder, uint64_t& device, uint64_t& memory, uin
 }
 
 uint64_t guest_call(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args) {
+    if (!fn) fatal("nvn: guest_call of a null function (a proc the driver does not have)");
     uint64_t saved[31];
     std::memcpy(saved, c.x, sizeof saved);
     size_t k = 0;
     for (uint64_t a : args) c.x[k++] = a;
-    call(c, fn);
+    if (HostFn host = host_fn_for(fn))
+        host(c);  // a host builder proc: run directly, no trip through the guest
+    else
+        call(c, fn);
     uint64_t r = c.x[0];
     std::memcpy(c.x, saved, sizeof saved);
     return r;
 }
 
 float guest_call_f(CPU& c, uint64_t fn, std::initializer_list<uint64_t> args) {
+    if (!fn) fatal("nvn: guest_call_f of a null function (a proc the driver does not have)");
     uint64_t saved[31];
     std::memcpy(saved, c.x, sizeof saved);
     V128 v0 = c.v[0];
     size_t k = 0;
     for (uint64_t a : args) c.x[k++] = a;
-    call(c, fn);
+    if (HostFn host = host_fn_for(fn))
+        host(c);
+    else
+        call(c, fn);
     float r = c.v[0].f32[0];
     std::memcpy(c.x, saved, sizeof saved);
     c.v[0] = v0;
@@ -302,10 +1031,13 @@ uint64_t scratch(CPU&, size_t size) {
 
 uint64_t real_proc_slow(CPU& c, const char* name);
 
+uint64_t driver_proc(CPU& c, const char* name) { return real_proc_slow(c, name); }
+
+// A proc for the runtime's own callers (the state-object getters, one per bound state): the SDK driver's, else the
+// host's version (host builders), else a function that stops with the proc's name. Never 0.
 uint64_t real_proc(CPU& c, const char* name) {
-    // The hot callers (state-object getters, one per bound state) pass string literals: a per-thread cache by the
-    // literal's address, verified by content, instead of a global mutex and a string-keyed tree at every call (the
-    // game's recording threads contended on that lock).
+    // The hot callers pass string literals: a per-thread cache by the literal's address, verified by content, instead
+    // of a global mutex and a string-keyed tree at every call (the game's recording threads contended on that lock).
     struct Hit {
         std::string name;
         uint64_t proc = 0;
@@ -313,7 +1045,20 @@ uint64_t real_proc(CPU& c, const char* name) {
     thread_local std::unordered_map<const char*, Hit> fast;
     if (auto it = fast.find(name); it != fast.end() && it->second.name == name) return it->second.proc;
     uint64_t found = real_proc_slow(c, name);
-    if (found) fast[name] = {name, found};
+    if (!found) found = host_proc_address(name);
+    if (!found) {
+        static std::mutex noted_lock;
+        static std::set<std::string> noted;
+        bool first;
+        {
+            std::lock_guard lk(noted_lock);
+            first = noted.insert(name).second;
+        }
+        if (first) log("nvn: real_proc(%s): no driver and no host version: calling it stops with this name", name);
+        const std::string stub = std::string("missing_") + name;
+        found = hle_address_or(stub.c_str(), missing_driver_proc);
+    }
+    fast[name] = {name, found};
     return found;
 }
 
