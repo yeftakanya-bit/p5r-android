@@ -196,8 +196,34 @@ static void log_candidates(const ModuleInfo& m, const char* label) {
     log("  %s: %zu candidates listed", label, shown);
 }
 
-// Guest functions that set up the SDK before nninitStartup, in this order. NX_PRE_INIT (config.txt) replaces the
-// default list: comma separated symbol names of the sdk or main module, or "none".
+// The global storage object of a C++ constructor symbol, found by name: _ZN2nn2os6detail17OsResourceManagerC2Ev ->
+// the class OsResourceManager -> the symbol containing "g_OsResourceManagerStorage". 0 if the name is not a
+// constructor or has no such storage.
+static uint64_t ctor_storage(const std::string& ctor, std::string* storage_name) {
+    if (ctor.compare(0, 3, "_ZN") != 0 || ctor.size() < 8) return 0;
+    const std::string tail = ctor.substr(ctor.size() - 4);
+    if (tail != "C2Ev" && tail != "C1Ev") return 0;
+    std::string cls;  // the last <length><identifier> before the constructor
+    size_t i = 3;
+    while (i < ctor.size() - 4 && ctor[i] >= '0' && ctor[i] <= '9') {
+        size_t len = 0;
+        while (i < ctor.size() && ctor[i] >= '0' && ctor[i] <= '9') len = len * 10 + size_t(ctor[i++] - '0');
+        if (len == 0 || i + len > ctor.size() - 4) break;
+        cls = ctor.substr(i, len);
+        i += len;
+    }
+    if (cls.empty()) return 0;
+    const std::string needle = "g_" + cls + "Storage";
+    uint64_t a = symbol_containing(*g_sdk, needle.c_str(), storage_name);
+    if (!a) a = symbol_containing(*g_main, needle.c_str(), storage_name);
+    return a;
+}
+
+// Guest functions that set up the SDK before nninitStartup, in this order. Default: the OS resource manager's
+// constructor, run on its global storage (g_OsResourceManagerStorage, found by name: x0 = the storage address), then
+// the main module's nninitInitializeSdkModule. NX_PRE_INIT (config.txt) replaces the list: comma separated symbol
+// names of the sdk or main module ("name@storage" gives the storage symbol for x0; a constructor name alone finds it),
+// or "none".
 static void run_pre_init(CPU& c) {
     std::vector<std::string> names;
     const char* env = std::getenv("NX_PRE_INIT");
@@ -212,18 +238,43 @@ static void run_pre_init(CPU& c) {
             }
         }
     } else {
-        names = {"_ZN2nn2os10InitializeEv",  // nn::os::Initialize(): creates the OS resource manager and main thread
-                 "nninitInitializeSdkModule"};  // the main module's stub into the sdk's module initialization
+        names = {"_ZN2nn2os6detail17OsResourceManagerC2Ev", "nninitInitializeSdkModule"};
     }
-    for (const std::string& name : names) {
+    for (const std::string& entry : names) {
+        std::string name = entry, storage_name;
+        uint64_t arg0 = 0;
+        const size_t at = entry.find('@');
+        if (at != std::string::npos) {
+            name = entry.substr(0, at);
+            storage_name = entry.substr(at + 1);
+            arg0 = symbol_any(storage_name.c_str());
+            if (!arg0) {
+                log("pre-init: storage %.160s not found, %.160s skipped", storage_name.c_str(), name.c_str());
+                continue;
+            }
+        } else {
+            arg0 = ctor_storage(name, &storage_name);
+        }
         const uint64_t addr = symbol_any(name.c_str());
         if (!addr) {
             log("pre-init: %.160s not found, skipped", name.c_str());
             continue;
         }
+        const bool is_ctor = name.size() > 4 && (name.compare(name.size() - 4, 4, "C2Ev") == 0 ||
+                                                 name.compare(name.size() - 4, 4, "C1Ev") == 0);
+        if (is_ctor && !arg0) {
+            // A constructor with x0 = 0 only faults: no storage to build the object in.
+            log("pre-init: no storage found for the constructor %.160s, skipped", name.c_str());
+            continue;
+        }
         for (int r = 0; r < 8; r++) c.x[r] = 0;
+        c.x[0] = arg0;
         c.x[30] = hle_address("__process_return");
-        log("pre-init: calling %.160s at %s", name.c_str(), describe(addr).c_str());
+        if (arg0)
+            log("pre-init: calling %.160s at %s, x0 = %llx (%.160s)", name.c_str(), describe(addr).c_str(),
+                (unsigned long long)arg0, storage_name.c_str());
+        else
+            log("pre-init: calling %.160s at %s", name.c_str(), describe(addr).c_str());
         call(c, addr);
         log("pre-init: %.160s returned (x0 = %llx)", name.c_str(), (unsigned long long)c.x[0]);
     }
@@ -416,7 +467,7 @@ void boot() {
             }
         } else if (real_main) {
             // Fallback 1: the game's own nnMain, after the SDK setup the missing Start would have done (see
-            // run_pre_init: nn::os::Initialize, the main module's nninitInitializeSdkModule), then nninitStartup
+            // run_pre_init: the OS resource manager constructor, the main module's nninitInitializeSdkModule), then nninitStartup
             // (the program's allocator and TLS), then nn_main (module constructors and nnMain).
             // Whatever else Start does (nn::diag, the main thread handle) is skipped: see the symbols above.
             const uint64_t startup = module_symbol(*g_main, "nninitStartup");
