@@ -261,7 +261,7 @@ public class Launcher extends Activity {
             }
             Intent launch = new Intent(this, Launcher.class).setAction(Intent.ACTION_MAIN);
             ShortcutInfo info = new ShortcutInfo.Builder(this, "picture_" + System.currentTimeMillis())
-                    .setShortLabel("P5R").setLongLabel("Persona 5 Royal").setIcon(Icon.createWithAdaptiveBitmap(icon))
+                    .setShortLabel("Farming Sim").setLongLabel("Farming Simulator Switch Edition").setIcon(Icon.createWithAdaptiveBitmap(icon))
                     .setIntent(launch).build();
             sm.requestPinShortcut(info, null);
             tell(t("Icono", "Icon"), t("Acepta el aviso para poner el acceso directo con tu imagen en la pantalla de inicio. "
@@ -278,7 +278,7 @@ public class Launcher extends Activity {
         return new File(dataDir(), "exefs/main").canRead() || new File(dataDir(), "analysis/main.bin").canRead();
     }
 
-    // The build ID the port is made for (Persona 5 Royal 1.0.0, the base game): the start of exefs/main's module ID
+    // The build ID of the original port (Persona 5 Royal 1.0.0); not enforced for Farming Simulator: the start of exefs/main's module ID
     // (NSO header +0x40). The native build refuses another (runtime main.cpp); say so here instead of closing.
     static final String[] KNOWN_BUILDS = {
         "708BCACA873EA32B",  // US
@@ -289,6 +289,7 @@ public class Launcher extends Activity {
 
     // Null when exefs/main is missing or a recognized base game version, else its build ID.
     String wrongBuild() {
+        if (true) return null;  // Farming Simulator: any build is accepted (same as NX_ALLOW_ANY_BUILD in the runtime)
         File main = new File(dataDir(), "exefs/main");
         if (!main.canRead()) return null;
         byte[] id = new byte[8];
@@ -307,9 +308,102 @@ public class Launcher extends Activity {
         return have;
     }
 
+    // ---- Java crash report ----
+    // Any uncaught Java exception (the launcher's, or the NativeActivity's: same process) is written to
+    // <data>/crash_java.txt and to logcat (tag P5RCrash), then handed to the system's own handler so Android still
+    // ends the process as usual. A crash in native code (SIGSEGV, SIGABRT in libp5r.so) never reaches Java: for those
+    // see the process exit reasons that exportLogs() adds.
+    static volatile boolean crashHandlerInstalled;
+
+    void installCrashHandler() {
+        if (crashHandlerInstalled) return;
+        crashHandlerInstalled = true;
+        final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+        final Context app = getApplicationContext();
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread thread, Throwable error) {
+                try {
+                    java.io.StringWriter sw = new java.io.StringWriter();
+                    java.io.PrintWriter pw = new java.io.PrintWriter(sw);
+                    pw.println("=== Java crash ===");
+                    pw.println("Time: " + new java.util.Date());
+                    pw.println("Thread: " + thread.getName() + " (pid " + android.os.Process.myPid() + ")");
+                    pw.println("Device: " + Build.MANUFACTURER + " " + Build.MODEL + ", Android " + Build.VERSION.RELEASE
+                            + " (API " + Build.VERSION.SDK_INT + ")");
+                    error.printStackTrace(pw);
+                    pw.println();
+                    pw.flush();
+                    String text = sw.toString();
+                    android.util.Log.e("P5RCrash", text);
+                    writeCrashFile(app, text);
+                } catch (Throwable ignored) {
+                }
+                if (previous != null) {
+                    previous.uncaughtException(thread, error);
+                } else {
+                    android.os.Process.killProcess(android.os.Process.myPid());
+                    System.exit(10);
+                }
+            }
+        });
+    }
+
+    // <data>/crash_java.txt (Internal storage/Persona 5 Royal/crash_java.txt), appended to. If that folder cannot be
+    // written (no all-files access yet), the app's own external files folder, then its private one.
+    static void writeCrashFile(Context app, String text) {
+        File[] places = new File[] {
+            new File(dataDir(), "crash_java.txt"),
+            new File(app.getExternalFilesDir(null), "crash_java.txt"),
+            new File(app.getFilesDir(), "crash_java.txt")
+        };
+        for (File f : places) {
+            try {
+                File dir = f.getParentFile();
+                if (dir != null && !dir.exists()) dir.mkdirs();
+                try (FileWriter w = new FileWriter(f, true)) {
+                    w.write(text);
+                }
+                return;
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    // Api 30+: why the last runs of this app ended (REASON_CRASH_NATIVE = a signal in native code). Kept in its own
+    // class so Android 10 can still verify Launcher.
+    static final class Api30ExitInfo {
+        static String describe(Context c) {
+            StringBuilder sb = new StringBuilder();
+            android.app.ActivityManager am = (android.app.ActivityManager) c.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return "no ActivityManager\n";
+            List<android.app.ApplicationExitInfo> list = am.getHistoricalProcessExitReasons(null, 0, 10);
+            for (android.app.ApplicationExitInfo i : list) {
+                String reason;
+                switch (i.getReason()) {
+                    case android.app.ApplicationExitInfo.REASON_CRASH: reason = "CRASH (Java)"; break;
+                    case android.app.ApplicationExitInfo.REASON_CRASH_NATIVE: reason = "CRASH_NATIVE"; break;
+                    case android.app.ApplicationExitInfo.REASON_SIGNALED: reason = "SIGNALED"; break;
+                    case android.app.ApplicationExitInfo.REASON_LOW_MEMORY: reason = "LOW_MEMORY"; break;
+                    case android.app.ApplicationExitInfo.REASON_ANR: reason = "ANR"; break;
+                    case android.app.ApplicationExitInfo.REASON_EXIT_SELF: reason = "EXIT_SELF"; break;
+                    case android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE: reason = "INITIALIZATION_FAILURE"; break;
+                    case android.app.ApplicationExitInfo.REASON_PERMISSION_CHANGE: reason = "PERMISSION_CHANGE"; break;
+                    case android.app.ApplicationExitInfo.REASON_USER_REQUESTED: reason = "USER_REQUESTED"; break;
+                    default: reason = "reason " + i.getReason(); break;
+                }
+                sb.append(new java.util.Date(i.getTimestamp())).append("  pid ").append(i.getPid())
+                        .append("  ").append(i.getProcessName()).append("  ").append(reason)
+                        .append("  status ").append(i.getStatus()).append("  ").append(i.getDescription()).append("\n");
+            }
+            return sb.toString();
+        }
+    }
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        installCrashHandler();
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
         // The game's texts and subtitles (runtime language.h): its own language names, as a console lists them.
         options.add(new Option("language", "Idioma de textos y subtítulos", "Text and subtitle language",
@@ -392,7 +486,7 @@ public class Launcher extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("PERSONA 5 ROYAL");
+        title.setText("FARMING SIMULATOR");
         title.setTextColor(Color.rgb(230, 0, 18));
         title.setTextSize(30);
         title.setTypeface(Typeface.DEFAULT_BOLD);
@@ -686,13 +780,13 @@ public class Launcher extends Activity {
             status.setText(Lang.f("Juego listo: %s", "Game ready: %s", gameName()));
             play.setText(t("Jugar", "Play"));
         } else if (!hasData()) {
-            status.setText(t("Elige el archivo de tu juego (.nsp o .xci de Persona 5 Royal 1.0.0) y tu prod.keys.",
-                    "Choose your game file (a Persona 5 Royal 1.0.0 .nsp or .xci) and your prod.keys."));
+            status.setText(t("Elige el archivo de tu juego (.nsp o .xci de Farming Simulator Switch Edition 1.5.0.1) y tu prod.keys.",
+                    "Choose your game file (a Farming Simulator Switch Edition 1.5.0.1 .nsp or .xci) and your prod.keys."));
             play.setText(t("Elegir el juego", "Choose the game"));
         } else if (wrongBuild() != null) {
-            status.setText(Lang.f("Almacenamiento interno/%s/exefs/main no es Persona 5 Royal 1.0.0 (build %s). Copia el "
+            status.setText(Lang.f("Almacenamiento interno/%s/exefs/main no es Farming Simulator Switch Edition (build %s). Copia el "
                             + "exefs del juego base, sin la actualización.",
-                    "Internal storage/%s/exefs/main is not Persona 5 Royal 1.0.0 (build %s). Copy the exefs of the base "
+                    "Internal storage/%s/exefs/main is not Farming Simulator Switch Edition (build %s). Copy the exefs of the base "
                             + "game, without the update.", DATA, wrongBuild()));
             play.setText(t("Volver a buscar", "Look again"));
         } else {
@@ -728,10 +822,10 @@ public class Launcher extends Activity {
     void askImport() {
         new AlertDialog.Builder(this)
                 .setTitle(t("Importar partidas", "Import saves"))
-                .setMessage(t("Elige un archivo ZIP o una carpeta con partidas de Persona 5 Royal (las carpetas DATA01, "
+                .setMessage(t("Elige un archivo ZIP o una carpeta con partidas de Farming Simulator (las carpetas DATA01, "
                                 + "DATA02... y SYSTEM, como las exporta JKSV o Checkpoint, o el ZIP que exporta este botón). "
                                 + "Antes se guarda una copia de tus partidas actuales.",
-                        "Pick a ZIP file or a folder with Persona 5 Royal saves (the DATA01, DATA02... and SYSTEM folders, "
+                        "Pick a ZIP file or a folder with Farming Simulator saves (the DATA01, DATA02... and SYSTEM folders, "
                                 + "as JKSV or Checkpoint export them, or the ZIP the Export button makes). Your current saves "
                                 + "are copied aside first."))
                 .setPositiveButton(t("Archivo ZIP", "ZIP file"), new DialogInterface.OnClickListener() {
@@ -791,8 +885,8 @@ public class Launcher extends Activity {
                     : request == PICK_FOLDER ? SaveFiles.importTree(getContentResolver(), data.getData()) : null;
             if (r == null) {
                 tell(t("No hay partidas", "No saves found"),
-                        t("Ahí no encontré partidas de Persona 5 Royal: busca las carpetas DATA01, DATA02... o SYSTEM.",
-                                "No Persona 5 Royal saves there: look for the DATA01, DATA02... or SYSTEM folders."));
+                        t("Ahí no encontré partidas de Farming Simulator: busca las carpetas DATA01, DATA02... o SYSTEM.",
+                                "No Farming Simulator saves there: look for the DATA01, DATA02... or SYSTEM folders."));
                 return;
             }
             String slots = r.slots.isEmpty() ? t("solo ajustes del sistema", "system settings only")
@@ -1022,13 +1116,14 @@ public class Launcher extends Activity {
             if (!dl.exists()) dl.mkdirs();
             File out = new File(dl, "p5r-log.txt");
             StringBuilder sb = new StringBuilder();
-            sb.append("=== Persona 5 Royal Recomp Log Export ===\n");
+            sb.append("=== Farming Simulator Recomp Log Export ===\n");
             sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
             sb.append("Android: ").append(Build.VERSION.RELEASE).append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
             sb.append("Date: ").append(new java.util.Date().toString()).append("\n\n");
 
             try {
-                Process p = Runtime.getRuntime().exec(new String[] {"logcat", "-d", "-t", "500"});
+                // The whole buffer, with thread ids and times (no -t 500: it cut the start of the story on Android 16).
+                Process p = new ProcessBuilder("logcat", "-d", "-v", "threadtime").redirectErrorStream(true).start();
                 try (BufferedReader br = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()))) {
                     String line;
                     while ((line = br.readLine()) != null) sb.append(line).append("\n");
@@ -1055,6 +1150,24 @@ public class Launcher extends Activity {
                 }
             }
 
+            File crashJava = new File(dataDir(), "crash_java.txt");
+            if (crashJava.exists()) {
+                sb.append("\n=== crash_java.txt ===\n");
+                try (BufferedReader br = new BufferedReader(new FileReader(crashJava))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line).append("\n");
+                }
+            }
+
+            if (Build.VERSION.SDK_INT >= 30) {
+                sb.append("\n=== process exit reasons (newest first) ===\n");
+                try {
+                    sb.append(Api30ExitInfo.describe(this));
+                } catch (Throwable e) {
+                    sb.append("exit reasons error: ").append(e).append("\n");
+                }
+            }
+
             try (FileWriter fw = new FileWriter(out)) {
                 fw.write(sb.toString());
             }
@@ -1066,7 +1179,7 @@ public class Launcher extends Activity {
             Intent share = new Intent(Intent.ACTION_SEND);
             share.setType("text/plain");
             share.putExtra(Intent.EXTRA_STREAM, logUri);
-            share.putExtra(Intent.EXTRA_SUBJECT, "Persona 5 Royal Debug Log");
+            share.putExtra(Intent.EXTRA_SUBJECT, "Farming Simulator Debug Log");
             share.setClipData(android.content.ClipData.newRawUri("Log", logUri));
             share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(Intent.createChooser(share, t("Compartir archivo de registros", "Share log file")));
