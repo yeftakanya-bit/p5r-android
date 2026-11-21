@@ -224,6 +224,11 @@ void boot() {
             std::snprintf(hex, sizeof hex, "%02X", b);
             have += hex;
         }
+        // Informational only: the Title ID of the game this fork is being adapted to. main.cpp never checked a
+        // Title ID; the only gate here is the main NSO build ID below.
+        constexpr const char* kFarmingSimTitleId = "0100D04004176000";  // Farming Simulator NSE, v1.5.0.1
+        log("target title id %s, main build id %s", kFarmingSimTitleId, have.c_str());
+
         const char* known_builds[] = {
             "708BCACA873EA32B", "B78A03E489E5BD92", "6E1F4CAE92A28C91", "2F2253ACD6BE5D87"
         };
@@ -231,13 +236,15 @@ void boot() {
         for (const char* k : known_builds) {
             if (have.compare(0, std::strlen(k), k) == 0) { known = true; break; }
         }
-        bool allow_any = std::getenv("NX_ALLOW_ANY_BUILD") || std::getenv("NX_IGNORE_VERSION");
+        // Bypass enabled by default. NX_ALLOW_ANY_BUILD=0 re-enables the strict check.
+        const char* strict = std::getenv("NX_ALLOW_ANY_BUILD");
+        bool allow_any = !(strict && *strict == '0');
         if (known) {
-            log("p5r: main build %s recognized and supported", have.c_str());
+            log("main build %s recognized (Persona 5 Royal)", have.c_str());
         } else if (allow_any) {
-            log("p5r: main build %s allowed by NX_ALLOW_ANY_BUILD switch", have.c_str());
+            log("main build %s accepted: build check bypassed", have.c_str());
         } else {
-            fatal("exefs/main is build %s, not %s: this port is made for Persona 5 Royal 1.0.0 (US, EU, JP, or Asia). Set NX_ALLOW_ANY_BUILD=1 to override.",
+            fatal("exefs/main is build %s, not %s. Remove NX_ALLOW_ANY_BUILD=0 to bypass.",
                   have.c_str(), want);
         }
     }
