@@ -178,6 +178,34 @@ static void unlock_mutex(uint64_t addr) {
     wake(next);
 }
 
+// A thread that ends while it still owns a userland mutex leaves that mutex locked for good (the kernel does not know
+// which mutex words a thread owns): whoever waits for it waits forever. Farming Simulator's heap lock was left that
+// way by its thread 0x10015, and the main thread hung in CentralHeap::Alloc. Two guards, both logged:
+//  - when a thread exits, every mutex that someone is already waiting for and that it still owns goes to the next
+//    waiter (release_mutexes_of_exiting, g_k held);
+//  - when a thread asks for a mutex whose owner has already exited, it is given the mutex (svc_arbitrate_lock).
+// The heap may be half updated if the owner died inside it: this keeps the game running, it does not repair it.
+static void release_mutexes_of_exiting(KThread* t) {
+    std::vector<uint64_t> addrs;
+    for (KThread* w : g_mutex_waiters) {
+        if (std::find(addrs.begin(), addrs.end(), w->wait_mutex) != addrs.end()) continue;
+        if ((load32(w->wait_mutex) & ~uint32_t(kHandleWaitMask)) == t->handle) addrs.push_back(w->wait_mutex);
+    }
+    for (uint64_t a : addrs) {
+        log("kernel: thread %llu (handle %x) exits still owning the mutex at %llx: handed to its next waiter",
+            (unsigned long long)t->id, t->handle, (unsigned long long)a);
+        unlock_mutex(a);
+    }
+}
+
+// True if `handle` is a thread that has exited (g_k held).
+static bool thread_exited(uint32_t handle) {
+    std::lock_guard al(g_all_lock);
+    for (auto& w : g_all)
+        if (auto t = w.lock(); t && t->handle == handle) return t->exited;
+    return false;
+}
+
 // ---- svc implementations --------------------------------------------------------------------------------------
 
 // ---- hang diagnostics: what every thread is doing --------------------------------------------------------------
@@ -302,6 +330,19 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
     std::unique_lock lk(g_k);
     KThread* self = t_self;
     if (load32(addr) != (owner | kHandleWaitMask)) return 0;
+    if (thread_exited(owner)) {
+        // The owner is gone and will never unlock it: this thread takes the mutex over (and others waiting stay
+        // waiting behind it, as the waiters bit says).
+        bool more = false;
+        for (KThread* w : g_mutex_waiters)
+            if (w->wait_mutex == addr) more = true;
+        store32(addr, tag | (more ? kHandleWaitMask : 0));
+        static std::atomic<int> takeovers{0};
+        if (takeovers.fetch_add(1) < 20)
+            log("kernel: thread %llu (handle %x) takes over the mutex at %llx from the exited thread %x",
+                (unsigned long long)self->id, self->handle, (unsigned long long)addr, owner);
+        return 0;
+    }
     self->wake = false;
     self->wait_mutex = addr;
     self->wait_tag = tag;
@@ -571,6 +612,7 @@ static void thread_main(void* p) {
     call(t->ctx, t->entry);
     // Returning from the entry point is like svcExitThread.
     std::lock_guard lk(g_k);
+    release_mutexes_of_exiting(t);
     t->exited = true;
     notify_all();
 }
@@ -722,7 +764,18 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
             {
                 // The lock must be released before the host thread ends: pthread_exit runs no C++ destructors on
                 // macOS, so a lock_guard alive across it kept the kernel locked for good (Wonder, ~frame 50).
+                static const bool quiet = [] {
+                    const char* e = std::getenv("NX_QUIET_THREAD_EXIT");
+                    return e && e[0] == '1';
+                }();
+                if (!quiet) {
+                    // Where each thread ends: the way to see which one leaves with a mutex still locked.
+                    log("kernel: thread %llu (handle %x) calls svcExitThread:", (unsigned long long)t_self->id,
+                        t_self->handle);
+                    backtrace(c);
+                }
                 std::lock_guard lk(g_k);
+                release_mutexes_of_exiting(t_self);
                 t_self->exited = true;
                 notify_all();
             }
