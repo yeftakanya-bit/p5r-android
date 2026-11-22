@@ -161,7 +161,7 @@ void host_pool_builder_get_flags(CPU& c) {
 // (not the builder's bytes) because the real sizes of the structs differ by builder and version. SetDefaults clears an
 // entry. The values marked "assumed" are NVN defaults this code has not checked against a driver.
 struct BuilderData {
-    uint64_t f[16];
+    uint64_t f[64];
 };
 std::mutex g_bd_lock;
 std::unordered_map<uint64_t, BuilderData> g_bd;
@@ -181,6 +181,12 @@ float float_of(uint64_t u) {
 }
 void put32(uint64_t addr, uint32_t v) {
     if (addr) std::memcpy(reinterpret_cast<void*>(addr), &v, 4);
+}
+void put8(uint64_t addr, uint8_t v) {
+    if (addr) std::memcpy(reinterpret_cast<void*>(addr), &v, 1);
+}
+void put64(uint64_t addr, uint64_t v) {
+    if (addr) std::memcpy(reinterpret_cast<void*>(addr), &v, 8);
 }
 
 // Queue builder defaults (assumed): command, compute and control memory, and the flush threshold.
@@ -560,7 +566,8 @@ void hb_TextureBuilderSetPackagedTextureData(CPU& c) {
 }
 
 void hb_TextureBuilderSetPackagedTextureLayout(CPU& c) {
-    (void)c;  // the layout is not kept: nothing reads it back yet
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) d->f[16] = c.x[1];  // the pointer the game gave (its struct is opaque here)
 }
 
 void hb_TextureBuilderGetFlags(CPU& c) {
@@ -655,6 +662,721 @@ void hb_TextureBuilderGetSwizzle(CPU& c) {
     put32(c.x[2], uint32_t(d->f[9] >> 8 & 0xff));
     put32(c.x[3], uint32_t(d->f[9] >> 16 & 0xff));
     put32(c.x[4], uint32_t(d->f[9] >> 24 & 0xff));
+}
+
+// ---- host state objects and texture views: the same side table. A Get returns what a Set stored (a state's fields are
+// the arguments of its setters; a keyed field (colour target index, face) is stored per key). SetDefaults clears all,
+// so a field the game never sets reads as 0: the numeric value of an NVN enum's default is not known here (assumed).
+// The setters/getters follow the NVN API as the author remembers it: see the notes in the reply.
+void hd_BlendState(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) std::memset(d, 0, sizeof *d);
+}
+
+void hs_BlendStateBlendTarget(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[0] = uint32_t(c.x[1]);
+}
+
+void hg_BlendStateBlendTarget(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0 + 0] : 0;
+}
+
+void hs_BlendStateBlendFunc(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[1] = uint32_t(c.x[1]);
+    d->f[2] = uint32_t(c.x[2]);
+    d->f[3] = uint32_t(c.x[3]);
+    d->f[4] = uint32_t(c.x[4]);
+}
+
+void hg_BlendStateBlendFunc(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    put32(c.x[1], uint32_t(d->f[1 + 0]));
+    put32(c.x[2], uint32_t(d->f[1 + 1]));
+    put32(c.x[3], uint32_t(d->f[1 + 2]));
+    put32(c.x[4], uint32_t(d->f[1 + 3]));
+}
+
+void hs_BlendStateBlendEquation(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[5] = uint32_t(c.x[1]);
+    d->f[6] = uint32_t(c.x[2]);
+}
+
+void hg_BlendStateBlendEquation(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    put32(c.x[1], uint32_t(d->f[5 + 0]));
+    put32(c.x[2], uint32_t(d->f[5 + 1]));
+}
+
+void hs_BlendStateAdvancedMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[7] = uint32_t(c.x[1]);
+}
+
+void hg_BlendStateAdvancedMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[7 + 0] : 0;
+}
+
+void hs_BlendStateAdvancedOverlap(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[8] = uint32_t(c.x[1]);
+}
+
+void hg_BlendStateAdvancedOverlap(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[8 + 0] : 0;
+}
+
+void hs_BlendStateAdvancedPremultipliedSrc(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[9] = (c.x[1]) & 0xff;
+}
+
+void hg_BlendStateAdvancedPremultipliedSrc(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[9 + 0] : 0;
+}
+
+void hs_BlendStateAdvancedNormalizedDst(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[10] = (c.x[1]) & 0xff;
+}
+
+void hg_BlendStateAdvancedNormalizedDst(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[10 + 0] : 0;
+}
+
+void hd_ColorState(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) std::memset(d, 0, sizeof *d);
+}
+
+void hs_ColorStateBlendEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    const uint32_t key = uint32_t(c.x[1]);
+    {
+        const uint32_t k = key;
+        d->f[0 + (k & 7) * 1 + 0] = (c.x[2]) & 0xff;
+    }
+}
+
+void hg_ColorStateBlendEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    const uint32_t k = uint32_t(c.x[1]);
+    c.x[0] = d ? d->f[0 + (k & 7) * 1 + 0] : 0;
+}
+
+void hs_ColorStateLogicOp(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[8] = uint32_t(c.x[1]);
+}
+
+void hg_ColorStateLogicOp(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[8 + 0] : 0;
+}
+
+void hs_ColorStateAlphaTest(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[9] = uint32_t(c.x[1]);
+}
+
+void hg_ColorStateAlphaTest(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[9 + 0] : 0;
+}
+
+void hd_ChannelMaskState(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) std::memset(d, 0, sizeof *d);
+}
+
+void hs_ChannelMaskStateChannelMask(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    const uint32_t key = uint32_t(c.x[1]);
+    {
+        const uint32_t k = key;
+        d->f[0 + (k & 7) * 4 + 0] = (c.x[2]) & 0xff;
+        d->f[0 + (k & 7) * 4 + 1] = (c.x[3]) & 0xff;
+        d->f[0 + (k & 7) * 4 + 2] = (c.x[4]) & 0xff;
+        d->f[0 + (k & 7) * 4 + 3] = (c.x[5]) & 0xff;
+    }
+}
+
+void hg_ChannelMaskStateChannelMask(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    const uint32_t k = uint32_t(c.x[1]);
+    if (!d) return;
+    put8(c.x[2], uint8_t(d->f[0 + (k & 7) * 4 + 0]));
+    put8(c.x[3], uint8_t(d->f[0 + (k & 7) * 4 + 1]));
+    put8(c.x[4], uint8_t(d->f[0 + (k & 7) * 4 + 2]));
+    put8(c.x[5], uint8_t(d->f[0 + (k & 7) * 4 + 3]));
+}
+
+void hd_DepthStencilState(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) std::memset(d, 0, sizeof *d);
+}
+
+void hs_DepthStencilStateDepthTestEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[0] = (c.x[1]) & 0xff;
+}
+
+void hg_DepthStencilStateDepthTestEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0 + 0] : 0;
+}
+
+void hs_DepthStencilStateDepthWriteEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[1] = (c.x[1]) & 0xff;
+}
+
+void hg_DepthStencilStateDepthWriteEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[1 + 0] : 0;
+}
+
+void hs_DepthStencilStateDepthFunc(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[2] = uint32_t(c.x[1]);
+}
+
+void hg_DepthStencilStateDepthFunc(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[2 + 0] : 0;
+}
+
+void hs_DepthStencilStateStencilTestEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[3] = (c.x[1]) & 0xff;
+}
+
+void hg_DepthStencilStateStencilTestEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[3 + 0] : 0;
+}
+
+void hs_DepthStencilStateStencilFunc(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    const uint32_t key = uint32_t(c.x[1]);
+    const uint32_t lo = key == 3 ? 1 : key, hi = key;  // both faces: front (1), back (2) and both (3)
+    for (uint32_t k = lo; k <= hi; k++) {
+        d->f[4 + (k & 7) * 1 + 0] = uint32_t(c.x[2]);
+    }
+}
+
+void hg_DepthStencilStateStencilFunc(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    const uint32_t k = uint32_t(c.x[1]);
+    c.x[0] = d ? d->f[4 + (k & 7) * 1 + 0] : 0;
+}
+
+void hs_DepthStencilStateStencilOp(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    const uint32_t key = uint32_t(c.x[1]);
+    const uint32_t lo = key == 3 ? 1 : key, hi = key;  // both faces: front (1), back (2) and both (3)
+    for (uint32_t k = lo; k <= hi; k++) {
+        d->f[12 + (k & 7) * 3 + 0] = uint32_t(c.x[2]);
+        d->f[12 + (k & 7) * 3 + 1] = uint32_t(c.x[3]);
+        d->f[12 + (k & 7) * 3 + 2] = uint32_t(c.x[4]);
+    }
+}
+
+void hg_DepthStencilStateStencilOp(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    const uint32_t k = uint32_t(c.x[1]);
+    if (!d) return;
+    put32(c.x[2], uint32_t(d->f[12 + (k & 7) * 3 + 0]));
+    put32(c.x[3], uint32_t(d->f[12 + (k & 7) * 3 + 1]));
+    put32(c.x[4], uint32_t(d->f[12 + (k & 7) * 3 + 2]));
+}
+
+void hd_MultisampleState(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) std::memset(d, 0, sizeof *d);
+}
+
+void hs_MultisampleStateMultisampleEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[0] = (c.x[1]) & 0xff;
+}
+
+void hg_MultisampleStateMultisampleEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0 + 0] : 0;
+}
+
+void hs_MultisampleStateSamples(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[1] = uint32_t(c.x[1]);
+}
+
+void hg_MultisampleStateSamples(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[1 + 0] : 0;
+}
+
+void hs_MultisampleStateAlphaToCoverageEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[2] = (c.x[1]) & 0xff;
+}
+
+void hg_MultisampleStateAlphaToCoverageEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[2 + 0] : 0;
+}
+
+void hs_MultisampleStateAlphaToCoverageDither(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[3] = (c.x[1]) & 0xff;
+}
+
+void hg_MultisampleStateAlphaToCoverageDither(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[3 + 0] : 0;
+}
+
+void hs_MultisampleStateRasterSamples(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[4] = uint32_t(c.x[1]);
+}
+
+void hg_MultisampleStateRasterSamples(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[4 + 0] : 0;
+}
+
+void hs_MultisampleStateCoverageModulationMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[5] = uint32_t(c.x[1]);
+}
+
+void hg_MultisampleStateCoverageModulationMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[5 + 0] : 0;
+}
+
+void hs_MultisampleStateCoverageToColorEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[6] = (c.x[1]) & 0xff;
+}
+
+void hg_MultisampleStateCoverageToColorEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[6 + 0] : 0;
+}
+
+void hs_MultisampleStateCoverageToColorOutput(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[7] = uint32_t(c.x[1]);
+}
+
+void hg_MultisampleStateCoverageToColorOutput(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[7 + 0] : 0;
+}
+
+void hs_MultisampleStateSampleLocationsEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[8] = (c.x[1]) & 0xff;
+}
+
+void hg_MultisampleStateSampleLocationsEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[8 + 0] : 0;
+}
+
+void hs_MultisampleStateSampleLocationsGridEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[9] = (c.x[1]) & 0xff;
+}
+
+void hg_MultisampleStateSampleLocationsGridEnable(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[9 + 0] : 0;
+}
+
+void hs_MultisampleStateSampleLocations(CPU& c) {
+    (void)c;  // custom sample positions are not kept: the replay uses the default pattern
+}
+
+void hg_MultisampleStateSampleLocationsGrid(CPU& c) {
+    put32(c.x[1], 1);  // width
+    put32(c.x[2], 1);  // height: no programmable grid
+}
+
+void hd_PolygonState(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) std::memset(d, 0, sizeof *d);
+}
+
+void hs_PolygonStateCullFace(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[0] = uint32_t(c.x[1]);
+}
+
+void hg_PolygonStateCullFace(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0 + 0] : 0;
+}
+
+void hs_PolygonStateFrontFace(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[1] = uint32_t(c.x[1]);
+}
+
+void hg_PolygonStateFrontFace(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[1 + 0] : 0;
+}
+
+void hs_PolygonStatePolygonMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[2] = uint32_t(c.x[1]);
+}
+
+void hg_PolygonStatePolygonMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[2 + 0] : 0;
+}
+
+void hs_PolygonStatePolygonOffsetEnables(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[3] = uint32_t(c.x[1]);
+}
+
+void hg_PolygonStatePolygonOffsetEnables(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[3 + 0] : 0;
+}
+
+void hd_VertexAttribState(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) std::memset(d, 0, sizeof *d);
+}
+
+void hs_VertexAttribStateFormat(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[0] = uint32_t(c.x[1]);
+    d->f[1] = c.x[2];
+}
+
+void hg_VertexAttribStateFormat(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    put32(c.x[1], uint32_t(d->f[0 + 0]));
+    put64(c.x[2], d->f[0 + 1]);
+}
+
+void hs_VertexAttribStateStreamIndex(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[2] = uint32_t(c.x[1]);
+}
+
+void hg_VertexAttribStateStreamIndex(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[2 + 0] : 0;
+}
+
+void hd_VertexStreamState(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) std::memset(d, 0, sizeof *d);
+}
+
+void hs_VertexStreamStateStride(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[0] = c.x[1];
+}
+
+void hg_VertexStreamStateStride(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0 + 0] : 0;
+}
+
+void hs_VertexStreamStateDivisor(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[1] = uint32_t(c.x[1]);
+}
+
+void hg_VertexStreamStateDivisor(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[1 + 0] : 0;
+}
+
+void hd_TextureView(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    if (BuilderData* d = bd(c.x[0])) std::memset(d, 0, sizeof *d);
+}
+
+void hs_TextureViewLevels(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[0] = uint32_t(c.x[1]);
+    d->f[1] = uint32_t(c.x[2]);
+    d->f[2] = 1;
+}
+
+void hg_TextureViewLevels(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !d->f[2]) {
+        c.x[0] = 0;
+        return;
+    }
+    put32(c.x[1], uint32_t(d->f[0 + 0]));
+    put32(c.x[2], uint32_t(d->f[0 + 1]));
+    c.x[0] = 1;
+}
+
+void hs_TextureViewLayers(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[3] = uint32_t(c.x[1]);
+    d->f[4] = uint32_t(c.x[2]);
+    d->f[5] = 1;
+}
+
+void hg_TextureViewLayers(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !d->f[5]) {
+        c.x[0] = 0;
+        return;
+    }
+    put32(c.x[1], uint32_t(d->f[3 + 0]));
+    put32(c.x[2], uint32_t(d->f[3 + 1]));
+    c.x[0] = 1;
+}
+
+void hs_TextureViewFormat(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[6] = uint32_t(c.x[1]);
+    d->f[7] = 1;
+}
+
+void hg_TextureViewFormat(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !d->f[7]) {
+        c.x[0] = 0;
+        return;
+    }
+    put32(c.x[1], uint32_t(d->f[6 + 0]));
+    c.x[0] = 1;
+}
+
+void hs_TextureViewSwizzle(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[8] = uint32_t(c.x[1]);
+    d->f[9] = uint32_t(c.x[2]);
+    d->f[10] = uint32_t(c.x[3]);
+    d->f[11] = uint32_t(c.x[4]);
+    d->f[12] = 1;
+}
+
+void hg_TextureViewSwizzle(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !d->f[12]) {
+        c.x[0] = 0;
+        return;
+    }
+    put32(c.x[1], uint32_t(d->f[8 + 0]));
+    put32(c.x[2], uint32_t(d->f[8 + 1]));
+    put32(c.x[3], uint32_t(d->f[8 + 2]));
+    put32(c.x[4], uint32_t(d->f[8 + 3]));
+    c.x[0] = 1;
+}
+
+void hs_TextureViewDepthStencilMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[13] = uint32_t(c.x[1]);
+    d->f[14] = 1;
+}
+
+void hg_TextureViewDepthStencilMode(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !d->f[14]) {
+        c.x[0] = 0;
+        return;
+    }
+    put32(c.x[1], uint32_t(d->f[13 + 0]));
+    c.x[0] = 1;
+}
+
+void hs_TextureViewTarget(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d) return;
+    d->f[15] = uint32_t(c.x[1]);
+    d->f[16] = 1;
+}
+
+void hg_TextureViewTarget(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    if (!d || !d->f[16]) {
+        c.x[0] = 0;
+        return;
+    }
+    put32(c.x[1], uint32_t(d->f[15 + 0]));
+    c.x[0] = 1;
+}
+
+void hc_TextureView(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* a = bd(c.x[0]);
+    BuilderData* b = bd(c.x[1]);
+    c.x[0] = a && b && std::memcmp(a->f, b->f, 17 * sizeof(uint64_t)) == 0 ? 1 : 0;
+}
+
+void hb_WindowBuilderGetNumTextures(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[3] : 0;
+}
+
+void hb_WindowBuilderGetTexture(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    const uint64_t index = uint32_t(c.x[1]);
+    c.x[0] = d && d->f[2] && index < d->f[3] ? reinterpret_cast<const uint64_t*>(d->f[2])[index] : 0;
+}
+
+void hb_WindowBuilderGetTextures(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[2] : 0;
+}
+
+void hb_TextureBuilderGetPackagedTextureLayout(CPU& c) {
+    // 0 when no layout was set (a game that does not use packaged textures); else the pointer the game gave.
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[16] : 0;
 }
 
 using HostFn = void (*)(CPU&);
@@ -754,6 +1476,104 @@ const HostProc kHostBuilderProcs[] = {
     {"nvnTextureBuilderGetMemoryOffset", hb_TextureBuilderGetMemoryOffset},
     {"nvnTextureBuilderGetPackagedTextureData", hb_TextureBuilderGetPackagedTextureData},
     {"nvnTextureBuilderGetSwizzle", hb_TextureBuilderGetSwizzle},
+    {"nvnBlendStateSetDefaults", hd_BlendState},
+    {"nvnBlendStateSetBlendTarget", hs_BlendStateBlendTarget},
+    {"nvnBlendStateGetBlendTarget", hg_BlendStateBlendTarget},
+    {"nvnBlendStateSetBlendFunc", hs_BlendStateBlendFunc},
+    {"nvnBlendStateGetBlendFunc", hg_BlendStateBlendFunc},
+    {"nvnBlendStateSetBlendEquation", hs_BlendStateBlendEquation},
+    {"nvnBlendStateGetBlendEquation", hg_BlendStateBlendEquation},
+    {"nvnBlendStateSetAdvancedMode", hs_BlendStateAdvancedMode},
+    {"nvnBlendStateGetAdvancedMode", hg_BlendStateAdvancedMode},
+    {"nvnBlendStateSetAdvancedOverlap", hs_BlendStateAdvancedOverlap},
+    {"nvnBlendStateGetAdvancedOverlap", hg_BlendStateAdvancedOverlap},
+    {"nvnBlendStateSetAdvancedPremultipliedSrc", hs_BlendStateAdvancedPremultipliedSrc},
+    {"nvnBlendStateGetAdvancedPremultipliedSrc", hg_BlendStateAdvancedPremultipliedSrc},
+    {"nvnBlendStateSetAdvancedNormalizedDst", hs_BlendStateAdvancedNormalizedDst},
+    {"nvnBlendStateGetAdvancedNormalizedDst", hg_BlendStateAdvancedNormalizedDst},
+    {"nvnColorStateSetDefaults", hd_ColorState},
+    {"nvnColorStateSetBlendEnable", hs_ColorStateBlendEnable},
+    {"nvnColorStateGetBlendEnable", hg_ColorStateBlendEnable},
+    {"nvnColorStateSetLogicOp", hs_ColorStateLogicOp},
+    {"nvnColorStateGetLogicOp", hg_ColorStateLogicOp},
+    {"nvnColorStateSetAlphaTest", hs_ColorStateAlphaTest},
+    {"nvnColorStateGetAlphaTest", hg_ColorStateAlphaTest},
+    {"nvnChannelMaskStateSetDefaults", hd_ChannelMaskState},
+    {"nvnChannelMaskStateSetChannelMask", hs_ChannelMaskStateChannelMask},
+    {"nvnChannelMaskStateGetChannelMask", hg_ChannelMaskStateChannelMask},
+    {"nvnDepthStencilStateSetDefaults", hd_DepthStencilState},
+    {"nvnDepthStencilStateSetDepthTestEnable", hs_DepthStencilStateDepthTestEnable},
+    {"nvnDepthStencilStateGetDepthTestEnable", hg_DepthStencilStateDepthTestEnable},
+    {"nvnDepthStencilStateSetDepthWriteEnable", hs_DepthStencilStateDepthWriteEnable},
+    {"nvnDepthStencilStateGetDepthWriteEnable", hg_DepthStencilStateDepthWriteEnable},
+    {"nvnDepthStencilStateSetDepthFunc", hs_DepthStencilStateDepthFunc},
+    {"nvnDepthStencilStateGetDepthFunc", hg_DepthStencilStateDepthFunc},
+    {"nvnDepthStencilStateSetStencilTestEnable", hs_DepthStencilStateStencilTestEnable},
+    {"nvnDepthStencilStateGetStencilTestEnable", hg_DepthStencilStateStencilTestEnable},
+    {"nvnDepthStencilStateSetStencilFunc", hs_DepthStencilStateStencilFunc},
+    {"nvnDepthStencilStateGetStencilFunc", hg_DepthStencilStateStencilFunc},
+    {"nvnDepthStencilStateSetStencilOp", hs_DepthStencilStateStencilOp},
+    {"nvnDepthStencilStateGetStencilOp", hg_DepthStencilStateStencilOp},
+    {"nvnMultisampleStateSetDefaults", hd_MultisampleState},
+    {"nvnMultisampleStateSetMultisampleEnable", hs_MultisampleStateMultisampleEnable},
+    {"nvnMultisampleStateGetMultisampleEnable", hg_MultisampleStateMultisampleEnable},
+    {"nvnMultisampleStateSetSamples", hs_MultisampleStateSamples},
+    {"nvnMultisampleStateGetSamples", hg_MultisampleStateSamples},
+    {"nvnMultisampleStateSetAlphaToCoverageEnable", hs_MultisampleStateAlphaToCoverageEnable},
+    {"nvnMultisampleStateGetAlphaToCoverageEnable", hg_MultisampleStateAlphaToCoverageEnable},
+    {"nvnMultisampleStateSetAlphaToCoverageDither", hs_MultisampleStateAlphaToCoverageDither},
+    {"nvnMultisampleStateGetAlphaToCoverageDither", hg_MultisampleStateAlphaToCoverageDither},
+    {"nvnMultisampleStateSetRasterSamples", hs_MultisampleStateRasterSamples},
+    {"nvnMultisampleStateGetRasterSamples", hg_MultisampleStateRasterSamples},
+    {"nvnMultisampleStateSetCoverageModulationMode", hs_MultisampleStateCoverageModulationMode},
+    {"nvnMultisampleStateGetCoverageModulationMode", hg_MultisampleStateCoverageModulationMode},
+    {"nvnMultisampleStateSetCoverageToColorEnable", hs_MultisampleStateCoverageToColorEnable},
+    {"nvnMultisampleStateGetCoverageToColorEnable", hg_MultisampleStateCoverageToColorEnable},
+    {"nvnMultisampleStateSetCoverageToColorOutput", hs_MultisampleStateCoverageToColorOutput},
+    {"nvnMultisampleStateGetCoverageToColorOutput", hg_MultisampleStateCoverageToColorOutput},
+    {"nvnMultisampleStateSetSampleLocationsEnable", hs_MultisampleStateSampleLocationsEnable},
+    {"nvnMultisampleStateGetSampleLocationsEnable", hg_MultisampleStateSampleLocationsEnable},
+    {"nvnMultisampleStateSetSampleLocationsGridEnable", hs_MultisampleStateSampleLocationsGridEnable},
+    {"nvnMultisampleStateGetSampleLocationsGridEnable", hg_MultisampleStateSampleLocationsGridEnable},
+    {"nvnMultisampleStateSetSampleLocations", hs_MultisampleStateSampleLocations},
+    {"nvnMultisampleStateGetSampleLocationsGrid", hg_MultisampleStateSampleLocationsGrid},
+    {"nvnPolygonStateSetDefaults", hd_PolygonState},
+    {"nvnPolygonStateSetCullFace", hs_PolygonStateCullFace},
+    {"nvnPolygonStateGetCullFace", hg_PolygonStateCullFace},
+    {"nvnPolygonStateSetFrontFace", hs_PolygonStateFrontFace},
+    {"nvnPolygonStateGetFrontFace", hg_PolygonStateFrontFace},
+    {"nvnPolygonStateSetPolygonMode", hs_PolygonStatePolygonMode},
+    {"nvnPolygonStateGetPolygonMode", hg_PolygonStatePolygonMode},
+    {"nvnPolygonStateSetPolygonOffsetEnables", hs_PolygonStatePolygonOffsetEnables},
+    {"nvnPolygonStateGetPolygonOffsetEnables", hg_PolygonStatePolygonOffsetEnables},
+    {"nvnVertexAttribStateSetDefaults", hd_VertexAttribState},
+    {"nvnVertexAttribStateSetFormat", hs_VertexAttribStateFormat},
+    {"nvnVertexAttribStateGetFormat", hg_VertexAttribStateFormat},
+    {"nvnVertexAttribStateSetStreamIndex", hs_VertexAttribStateStreamIndex},
+    {"nvnVertexAttribStateGetStreamIndex", hg_VertexAttribStateStreamIndex},
+    {"nvnVertexStreamStateSetDefaults", hd_VertexStreamState},
+    {"nvnVertexStreamStateSetStride", hs_VertexStreamStateStride},
+    {"nvnVertexStreamStateGetStride", hg_VertexStreamStateStride},
+    {"nvnVertexStreamStateSetDivisor", hs_VertexStreamStateDivisor},
+    {"nvnVertexStreamStateGetDivisor", hg_VertexStreamStateDivisor},
+    {"nvnTextureViewSetDefaults", hd_TextureView},
+    {"nvnTextureViewSetLevels", hs_TextureViewLevels},
+    {"nvnTextureViewGetLevels", hg_TextureViewLevels},
+    {"nvnTextureViewSetLayers", hs_TextureViewLayers},
+    {"nvnTextureViewGetLayers", hg_TextureViewLayers},
+    {"nvnTextureViewSetFormat", hs_TextureViewFormat},
+    {"nvnTextureViewGetFormat", hg_TextureViewFormat},
+    {"nvnTextureViewSetSwizzle", hs_TextureViewSwizzle},
+    {"nvnTextureViewGetSwizzle", hg_TextureViewSwizzle},
+    {"nvnTextureViewSetDepthStencilMode", hs_TextureViewDepthStencilMode},
+    {"nvnTextureViewGetDepthStencilMode", hg_TextureViewDepthStencilMode},
+    {"nvnTextureViewSetTarget", hs_TextureViewTarget},
+    {"nvnTextureViewGetTarget", hg_TextureViewTarget},
+    {"nvnTextureViewCompare", hc_TextureView},
+    {"nvnWindowBuilderGetNumTextures", hb_WindowBuilderGetNumTextures},
+    {"nvnWindowBuilderGetTexture", hb_WindowBuilderGetTexture},
+    {"nvnWindowBuilderGetTextures", hb_WindowBuilderGetTextures},
+    {"nvnTextureBuilderGetPackagedTextureLayout", hb_TextureBuilderGetPackagedTextureLayout},
 };
 
 std::mutex g_host_lock;
@@ -977,6 +1797,104 @@ NX_HLE("host_nvnTextureBuilderGetMemoryPool", hb_TextureBuilderGetMemoryPool);
 NX_HLE("host_nvnTextureBuilderGetMemoryOffset", hb_TextureBuilderGetMemoryOffset);
 NX_HLE("host_nvnTextureBuilderGetPackagedTextureData", hb_TextureBuilderGetPackagedTextureData);
 NX_HLE("host_nvnTextureBuilderGetSwizzle", hb_TextureBuilderGetSwizzle);
+NX_HLE("host_nvnBlendStateSetDefaults", hd_BlendState);
+NX_HLE("host_nvnBlendStateSetBlendTarget", hs_BlendStateBlendTarget);
+NX_HLE("host_nvnBlendStateGetBlendTarget", hg_BlendStateBlendTarget);
+NX_HLE("host_nvnBlendStateSetBlendFunc", hs_BlendStateBlendFunc);
+NX_HLE("host_nvnBlendStateGetBlendFunc", hg_BlendStateBlendFunc);
+NX_HLE("host_nvnBlendStateSetBlendEquation", hs_BlendStateBlendEquation);
+NX_HLE("host_nvnBlendStateGetBlendEquation", hg_BlendStateBlendEquation);
+NX_HLE("host_nvnBlendStateSetAdvancedMode", hs_BlendStateAdvancedMode);
+NX_HLE("host_nvnBlendStateGetAdvancedMode", hg_BlendStateAdvancedMode);
+NX_HLE("host_nvnBlendStateSetAdvancedOverlap", hs_BlendStateAdvancedOverlap);
+NX_HLE("host_nvnBlendStateGetAdvancedOverlap", hg_BlendStateAdvancedOverlap);
+NX_HLE("host_nvnBlendStateSetAdvancedPremultipliedSrc", hs_BlendStateAdvancedPremultipliedSrc);
+NX_HLE("host_nvnBlendStateGetAdvancedPremultipliedSrc", hg_BlendStateAdvancedPremultipliedSrc);
+NX_HLE("host_nvnBlendStateSetAdvancedNormalizedDst", hs_BlendStateAdvancedNormalizedDst);
+NX_HLE("host_nvnBlendStateGetAdvancedNormalizedDst", hg_BlendStateAdvancedNormalizedDst);
+NX_HLE("host_nvnColorStateSetDefaults", hd_ColorState);
+NX_HLE("host_nvnColorStateSetBlendEnable", hs_ColorStateBlendEnable);
+NX_HLE("host_nvnColorStateGetBlendEnable", hg_ColorStateBlendEnable);
+NX_HLE("host_nvnColorStateSetLogicOp", hs_ColorStateLogicOp);
+NX_HLE("host_nvnColorStateGetLogicOp", hg_ColorStateLogicOp);
+NX_HLE("host_nvnColorStateSetAlphaTest", hs_ColorStateAlphaTest);
+NX_HLE("host_nvnColorStateGetAlphaTest", hg_ColorStateAlphaTest);
+NX_HLE("host_nvnChannelMaskStateSetDefaults", hd_ChannelMaskState);
+NX_HLE("host_nvnChannelMaskStateSetChannelMask", hs_ChannelMaskStateChannelMask);
+NX_HLE("host_nvnChannelMaskStateGetChannelMask", hg_ChannelMaskStateChannelMask);
+NX_HLE("host_nvnDepthStencilStateSetDefaults", hd_DepthStencilState);
+NX_HLE("host_nvnDepthStencilStateSetDepthTestEnable", hs_DepthStencilStateDepthTestEnable);
+NX_HLE("host_nvnDepthStencilStateGetDepthTestEnable", hg_DepthStencilStateDepthTestEnable);
+NX_HLE("host_nvnDepthStencilStateSetDepthWriteEnable", hs_DepthStencilStateDepthWriteEnable);
+NX_HLE("host_nvnDepthStencilStateGetDepthWriteEnable", hg_DepthStencilStateDepthWriteEnable);
+NX_HLE("host_nvnDepthStencilStateSetDepthFunc", hs_DepthStencilStateDepthFunc);
+NX_HLE("host_nvnDepthStencilStateGetDepthFunc", hg_DepthStencilStateDepthFunc);
+NX_HLE("host_nvnDepthStencilStateSetStencilTestEnable", hs_DepthStencilStateStencilTestEnable);
+NX_HLE("host_nvnDepthStencilStateGetStencilTestEnable", hg_DepthStencilStateStencilTestEnable);
+NX_HLE("host_nvnDepthStencilStateSetStencilFunc", hs_DepthStencilStateStencilFunc);
+NX_HLE("host_nvnDepthStencilStateGetStencilFunc", hg_DepthStencilStateStencilFunc);
+NX_HLE("host_nvnDepthStencilStateSetStencilOp", hs_DepthStencilStateStencilOp);
+NX_HLE("host_nvnDepthStencilStateGetStencilOp", hg_DepthStencilStateStencilOp);
+NX_HLE("host_nvnMultisampleStateSetDefaults", hd_MultisampleState);
+NX_HLE("host_nvnMultisampleStateSetMultisampleEnable", hs_MultisampleStateMultisampleEnable);
+NX_HLE("host_nvnMultisampleStateGetMultisampleEnable", hg_MultisampleStateMultisampleEnable);
+NX_HLE("host_nvnMultisampleStateSetSamples", hs_MultisampleStateSamples);
+NX_HLE("host_nvnMultisampleStateGetSamples", hg_MultisampleStateSamples);
+NX_HLE("host_nvnMultisampleStateSetAlphaToCoverageEnable", hs_MultisampleStateAlphaToCoverageEnable);
+NX_HLE("host_nvnMultisampleStateGetAlphaToCoverageEnable", hg_MultisampleStateAlphaToCoverageEnable);
+NX_HLE("host_nvnMultisampleStateSetAlphaToCoverageDither", hs_MultisampleStateAlphaToCoverageDither);
+NX_HLE("host_nvnMultisampleStateGetAlphaToCoverageDither", hg_MultisampleStateAlphaToCoverageDither);
+NX_HLE("host_nvnMultisampleStateSetRasterSamples", hs_MultisampleStateRasterSamples);
+NX_HLE("host_nvnMultisampleStateGetRasterSamples", hg_MultisampleStateRasterSamples);
+NX_HLE("host_nvnMultisampleStateSetCoverageModulationMode", hs_MultisampleStateCoverageModulationMode);
+NX_HLE("host_nvnMultisampleStateGetCoverageModulationMode", hg_MultisampleStateCoverageModulationMode);
+NX_HLE("host_nvnMultisampleStateSetCoverageToColorEnable", hs_MultisampleStateCoverageToColorEnable);
+NX_HLE("host_nvnMultisampleStateGetCoverageToColorEnable", hg_MultisampleStateCoverageToColorEnable);
+NX_HLE("host_nvnMultisampleStateSetCoverageToColorOutput", hs_MultisampleStateCoverageToColorOutput);
+NX_HLE("host_nvnMultisampleStateGetCoverageToColorOutput", hg_MultisampleStateCoverageToColorOutput);
+NX_HLE("host_nvnMultisampleStateSetSampleLocationsEnable", hs_MultisampleStateSampleLocationsEnable);
+NX_HLE("host_nvnMultisampleStateGetSampleLocationsEnable", hg_MultisampleStateSampleLocationsEnable);
+NX_HLE("host_nvnMultisampleStateSetSampleLocationsGridEnable", hs_MultisampleStateSampleLocationsGridEnable);
+NX_HLE("host_nvnMultisampleStateGetSampleLocationsGridEnable", hg_MultisampleStateSampleLocationsGridEnable);
+NX_HLE("host_nvnMultisampleStateSetSampleLocations", hs_MultisampleStateSampleLocations);
+NX_HLE("host_nvnMultisampleStateGetSampleLocationsGrid", hg_MultisampleStateSampleLocationsGrid);
+NX_HLE("host_nvnPolygonStateSetDefaults", hd_PolygonState);
+NX_HLE("host_nvnPolygonStateSetCullFace", hs_PolygonStateCullFace);
+NX_HLE("host_nvnPolygonStateGetCullFace", hg_PolygonStateCullFace);
+NX_HLE("host_nvnPolygonStateSetFrontFace", hs_PolygonStateFrontFace);
+NX_HLE("host_nvnPolygonStateGetFrontFace", hg_PolygonStateFrontFace);
+NX_HLE("host_nvnPolygonStateSetPolygonMode", hs_PolygonStatePolygonMode);
+NX_HLE("host_nvnPolygonStateGetPolygonMode", hg_PolygonStatePolygonMode);
+NX_HLE("host_nvnPolygonStateSetPolygonOffsetEnables", hs_PolygonStatePolygonOffsetEnables);
+NX_HLE("host_nvnPolygonStateGetPolygonOffsetEnables", hg_PolygonStatePolygonOffsetEnables);
+NX_HLE("host_nvnVertexAttribStateSetDefaults", hd_VertexAttribState);
+NX_HLE("host_nvnVertexAttribStateSetFormat", hs_VertexAttribStateFormat);
+NX_HLE("host_nvnVertexAttribStateGetFormat", hg_VertexAttribStateFormat);
+NX_HLE("host_nvnVertexAttribStateSetStreamIndex", hs_VertexAttribStateStreamIndex);
+NX_HLE("host_nvnVertexAttribStateGetStreamIndex", hg_VertexAttribStateStreamIndex);
+NX_HLE("host_nvnVertexStreamStateSetDefaults", hd_VertexStreamState);
+NX_HLE("host_nvnVertexStreamStateSetStride", hs_VertexStreamStateStride);
+NX_HLE("host_nvnVertexStreamStateGetStride", hg_VertexStreamStateStride);
+NX_HLE("host_nvnVertexStreamStateSetDivisor", hs_VertexStreamStateDivisor);
+NX_HLE("host_nvnVertexStreamStateGetDivisor", hg_VertexStreamStateDivisor);
+NX_HLE("host_nvnTextureViewSetDefaults", hd_TextureView);
+NX_HLE("host_nvnTextureViewSetLevels", hs_TextureViewLevels);
+NX_HLE("host_nvnTextureViewGetLevels", hg_TextureViewLevels);
+NX_HLE("host_nvnTextureViewSetLayers", hs_TextureViewLayers);
+NX_HLE("host_nvnTextureViewGetLayers", hg_TextureViewLayers);
+NX_HLE("host_nvnTextureViewSetFormat", hs_TextureViewFormat);
+NX_HLE("host_nvnTextureViewGetFormat", hg_TextureViewFormat);
+NX_HLE("host_nvnTextureViewSetSwizzle", hs_TextureViewSwizzle);
+NX_HLE("host_nvnTextureViewGetSwizzle", hg_TextureViewSwizzle);
+NX_HLE("host_nvnTextureViewSetDepthStencilMode", hs_TextureViewDepthStencilMode);
+NX_HLE("host_nvnTextureViewGetDepthStencilMode", hg_TextureViewDepthStencilMode);
+NX_HLE("host_nvnTextureViewSetTarget", hs_TextureViewTarget);
+NX_HLE("host_nvnTextureViewGetTarget", hg_TextureViewTarget);
+NX_HLE("host_nvnTextureViewCompare", hc_TextureView);
+NX_HLE("host_nvnWindowBuilderGetNumTextures", hb_WindowBuilderGetNumTextures);
+NX_HLE("host_nvnWindowBuilderGetTexture", hb_WindowBuilderGetTexture);
+NX_HLE("host_nvnWindowBuilderGetTextures", hb_WindowBuilderGetTextures);
+NX_HLE("host_nvnTextureBuilderGetPackagedTextureLayout", hb_TextureBuilderGetPackagedTextureLayout);
 
 namespace nvn {
 
