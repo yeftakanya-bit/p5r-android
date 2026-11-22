@@ -9,10 +9,17 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+
+#include <dlfcn.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <ucontext.h>
+#include <unistd.h>
 
 #include <nx/game.h>
 
@@ -173,6 +180,124 @@ static void unlock_mutex(uint64_t addr) {
 
 // ---- svc implementations --------------------------------------------------------------------------------------
 
+// ---- hang diagnostics: what every thread is doing --------------------------------------------------------------
+// A thread blocked in an svc has its guest registers saved (KThread::ctx). A thread that is running guest code, or
+// is inside some other host call, has not: it is asked for them with a signal (its handler copies the registers it
+// was interrupted with), then walked like the others. Used when a mutex stays locked: whoever owns it may be exactly
+// the thread no wait list shows.
+namespace {
+
+struct ThreadSnapshot {
+    std::atomic<int> ready{0};
+    uint64_t x[31] = {};
+    uint64_t sp = 0, pc = 0;
+};
+ThreadSnapshot g_snap;
+std::mutex g_snap_lock;
+
+int snapshot_signal() { return SIGRTMIN + 3; }
+
+void snapshot_handler(int, siginfo_t*, void* uc) {
+    const mcontext_t& m = static_cast<ucontext_t*>(uc)->uc_mcontext;
+    for (int i = 0; i < 31; i++) g_snap.x[i] = m.regs[i];
+    g_snap.sp = m.sp;
+    g_snap.pc = m.pc;
+    g_snap.ready.store(1, std::memory_order_release);
+}
+
+// Interrupt `t` and take its registers into g_snap (g_snap_lock held). False if it did not answer in 300 ms.
+bool sample_thread(const KThread* t) {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        struct sigaction sa {};
+        sa.sa_sigaction = snapshot_handler;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        sigaction(snapshot_signal(), &sa, nullptr);
+    });
+    if (!t->host_tid) return false;
+    g_snap.ready.store(0);
+    if (syscall(SYS_tgkill, getpid(), pid_t(t->host_tid), snapshot_signal()) != 0) return false;
+    for (int i = 0; i < 300; i++) {
+        if (g_snap.ready.load(std::memory_order_acquire)) return true;
+        plat::sleep_ns(1'000'000);
+    }
+    return false;
+}
+
+void print_sample(KThread* t, int round) {
+    std::lock_guard lk(g_snap_lock);
+    if (!sample_thread(t)) {
+        log("  sample %d: the thread did not answer the signal (host tid %lld)", round, (long long)t->host_tid);
+        return;
+    }
+    const std::string where = describe(g_snap.pc);
+    const bool guest = where.rfind("main+", 0) == 0 || where.rfind("sdk+", 0) == 0;
+    if (guest) {
+        log("  sample %d: running guest code, pc %llx (%s)", round, (unsigned long long)g_snap.pc, where.c_str());
+        CPU c = t->ctx;
+        for (int i = 0; i < 31; i++) c.x[i] = g_snap.x[i];
+        c.x[31] = g_snap.sp;
+        backtrace(c);
+    } else {
+        Dl_info d{};
+        if (dladdr(reinterpret_cast<void*>(g_snap.pc), &d) && d.dli_fname) {
+            const char* slash = std::strrchr(d.dli_fname, '/');
+            log("  sample %d: in host code, pc %llx = %s+%llx (%s); its last guest state:", round,
+                (unsigned long long)g_snap.pc, slash ? slash + 1 : d.dli_fname,
+                (unsigned long long)(g_snap.pc - uint64_t(d.dli_fbase)), d.dli_sname ? d.dli_sname : "no symbol");
+        } else {
+            log("  sample %d: pc %llx (%s); its last guest state:", round, (unsigned long long)g_snap.pc,
+                where.c_str());
+        }
+        backtrace(t->ctx);  // the registers it had at its last svc / host call
+    }
+}
+
+}  // namespace
+
+// Every live thread: its state, and a backtrace (saved registers when it is blocked in an svc; two signal samples
+// 0.5 s apart when it is not, or when it is `focus_handle`). Call it from the hang detector with the reason.
+void kernel_dump_all_threads(const char* reason, uint32_t focus_handle) {
+    log("kernel: thread dump (%s)", reason);
+    std::vector<std::shared_ptr<KThread>> all;
+    {
+        std::lock_guard al(g_all_lock);
+        for (auto& w : g_all)
+            if (auto t = w.lock()) all.push_back(t);
+    }
+    for (auto& t : all) {
+        const char* wait = "running or in a host call";
+        {
+            std::lock_guard<std::recursive_mutex> kl(g_k);
+            auto in = [&](const std::vector<KThread*>& v) { return std::find(v.begin(), v.end(), t.get()) != v.end(); };
+            if (t->exited) wait = "exited";
+            else if (in(g_mutex_waiters)) wait = "waits for a mutex";
+            else if (in(g_cv_waiters)) wait = "waits on a condition variable";
+            else if (in(g_addr_waiters)) wait = "waits on an address";
+            else if (in(g_sync_waiters)) wait = "waits on kernel objects";
+            else if (!t->started) wait = "not started";
+        }
+        const bool focus = t->handle == focus_handle;
+        log("kernel: thread %llu handle %x%s: %s (host tid %lld, entry %llx)", (unsigned long long)t->id, t->handle,
+            focus ? " [the owner of the stuck mutex]" : "", wait, (long long)t->host_tid,
+            (unsigned long long)t->entry);
+        if (t->exited || !t->started) continue;
+        const bool blocked = wait[0] == 'w';  // "waits ..."
+        if (blocked && !focus) {
+            backtrace(t->ctx);
+            continue;
+        }
+        print_sample(t.get(), 1);
+        if (focus || !blocked) {
+            plat::sleep_ns(500'000'000);
+            print_sample(t.get(), 2);
+        }
+    }
+}
+
+// Arbitrate (take) a mutex whose owner is `owner`. After 5 s without a hand-over it reports who owns the mutex and
+// what every thread is doing, once per mutex, then keeps waiting.
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
     std::unique_lock lk(g_k);
     KThread* self = t_self;
@@ -181,6 +306,25 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
     self->wait_mutex = addr;
     self->wait_tag = tag;
     g_mutex_waiters.push_back(self);
+    if (block(lk, self, 5'000'000'000)) return self->wait_result;
+    static std::set<uint64_t> reported;  // g_k held
+    if (reported.insert(addr).second) {
+        const uint32_t word = load32(addr);
+        const uint32_t owner_now = word & ~uint32_t(kHandleWaitMask);
+        bool owner_known = false, owner_exited = false;
+        {
+            std::lock_guard al(g_all_lock);
+            for (auto& w : g_all)
+                if (auto t = w.lock(); t && t->handle == owner_now) owner_known = true, owner_exited = t->exited;
+        }
+        log("kernel: thread %llu (handle %x) has waited 5 s for the mutex at %llx: word %08x, owner handle %x%s",
+            (unsigned long long)self->id, self->handle, (unsigned long long)addr, word, owner_now,
+            !owner_known ? " (no such thread: its handle was closed or never was a thread)"
+                         : owner_exited ? " (that thread has EXITED while holding it)" : "");
+        lk.unlock();  // the owner may need the kernel lock to make progress
+        kernel_dump_all_threads("a mutex has been locked for 5 s", owner_now);
+        lk.lock();
+    }
     block(lk, self, -1);
     return self->wait_result;
 }
