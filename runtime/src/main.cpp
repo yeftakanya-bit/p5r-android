@@ -238,6 +238,44 @@ static void log_symbols(const ModuleInfo& m, const char* label, size_t limit) {
     }
 }
 
+// The defined symbols of a module around an offset, in address order. A backtrace address that is exactly a symbol's
+// start usually means the call before it was the last instruction of the function AHEAD of that symbol (a call that
+// never returns, as to an abort), so the real caller is the symbol just before the one the backtrace names.
+static void log_symbols_near(const ModuleInfo& m, const char* label, uint64_t off) {
+    struct Hit {
+        uint64_t value;
+        const char* name;
+    };
+    std::vector<Hit> hits;
+    for (size_t k = 0; k < m.symbol_count; k++) {
+        if (m.symbols[k].imported || !m.symbols[k].name) continue;
+        const uint64_t v = m.symbols[k].value;
+        if (v + 0x400 >= off && v <= off + 0x40) hits.push_back({v, m.symbols[k].name});
+    }
+    std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.value < b.value; });
+    log("symbols of %s around +%llx: %zu", label, (unsigned long long)off, hits.size());
+    for (const Hit& h : hits) log("  %s+%llx  %.160s", label, (unsigned long long)h.value, h.name);
+}
+
+// NX_SYM_NEAR (config.txt): "sdk:4aa3c,main:419ec", offsets in hex; the default is the sdk frame of the last abort.
+static void log_symbols_near_env() {
+    const char* env = std::getenv("NX_SYM_NEAR");
+    const std::string spec = env && *env ? env : "sdk:4aa3c";
+    size_t i = 0;
+    while (i < spec.size()) {
+        size_t j = spec.find(',', i);
+        if (j == std::string::npos) j = spec.size();
+        const std::string item = spec.substr(i, j - i);
+        i = j + 1;
+        const size_t colon = item.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string which = item.substr(0, colon);
+        const uint64_t off = std::strtoull(item.c_str() + colon + 1, nullptr, 16);
+        if (which == "sdk") log_symbols_near(*g_sdk, "sdk", off);
+        else if (which == "main") log_symbols_near(*g_main, "main", off);
+    }
+}
+
 // First defined symbol of the module whose name contains `needle` (the address, 0 if none; the name in *name).
 static uint64_t symbol_containing(const ModuleInfo& m, const char* needle, std::string* name) {
     for (size_t k = 0; k < m.symbol_count; k++) {
@@ -359,6 +397,50 @@ static void run_pre_init(CPU& c) {
             log("pre-init: calling %.160s at %s", name.c_str(), describe(addr).c_str());
         call(c, addr);
         log("pre-init: %.160s returned (x0 = %llx)", name.c_str(), (unsigned long long)c.x[0]);
+    }
+}
+
+// Naming what a backtrace frame points at. NX_SYM_AT=sdk+4aa3c,main+419ec (hex offsets into a module, or an absolute
+// hex address) logs the defined symbols just before and after each address. A frame that is the return address of a call
+// that never returns (an abort) lands on the FIRST byte of the NEXT function ("name+0"): the caller is then the symbol
+// just before it. NX_SYM_PREFIX=_ZN2nn2fs logs every defined symbol with that prefix, in address order (up to 400).
+static void log_symbols_at(const char* spec, const char* prefix) {
+    std::vector<std::pair<uint64_t, std::string>> all;
+    for (const ModuleInfo* m : {g_main, g_sdk})
+        for (size_t k = 0; k < m->symbol_count; k++)
+            if (!m->symbols[k].imported && m->symbols[k].name)
+                all.emplace_back(m->base + m->symbols[k].value, m->symbols[k].name);
+    std::sort(all.begin(), all.end());
+    if (spec && *spec) {
+        std::string list = spec, item;
+        for (size_t i = 0; i <= list.size(); i++) {
+            if (i < list.size() && list[i] != ',') {
+                if (list[i] != ' ') item += list[i];
+                continue;
+            }
+            if (!item.empty()) {
+                uint64_t base = 0;
+                std::string hex = item;
+                if (item.compare(0, 4, "sdk+") == 0) base = g_sdk->base, hex = item.substr(4);
+                else if (item.compare(0, 5, "main+") == 0) base = g_main->base, hex = item.substr(5);
+                const uint64_t addr = base + std::strtoull(hex.c_str(), nullptr, 16);
+                const size_t at = size_t(std::lower_bound(all.begin(), all.end(), std::make_pair(addr, std::string())) - all.begin());
+                log("symbols around %s (%llx):", item.c_str(), (unsigned long long)addr);
+                for (size_t k = at >= 4 ? at - 4 : 0; k < all.size() && k < at + 3; k++)
+                    log("  %s%llx %.200s", k < at ? "before " : "at/after ", (unsigned long long)all[k].first,
+                        all[k].second.c_str());
+            }
+            item.clear();
+        }
+    }
+    if (prefix && *prefix) {
+        size_t shown = 0;
+        for (const auto& e : all) {
+            if (e.second.compare(0, std::strlen(prefix), prefix) != 0) continue;
+            if (shown++ >= 400) break;
+            log("  %llx %.200s", (unsigned long long)e.first, e.second.c_str());
+        }
+        log("symbols with prefix %s: %zu listed", prefix, shown);
     }
 }
 
@@ -494,6 +576,9 @@ void boot() {
     }
 
     g_main = &nso[0]->info, g_sdk = &nso[1]->info;
+    if (std::getenv("NX_SYM_AT") || std::getenv("NX_SYM_PREFIX"))
+        log_symbols_at(std::getenv("NX_SYM_AT"), std::getenv("NX_SYM_PREFIX"));
+    log_symbols_near_env();
     std::vector<const ModuleInfo*> mods;
     std::vector<const uint8_t*> img_ptrs;
     for (const auto& m : nso) {
