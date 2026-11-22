@@ -1379,6 +1379,92 @@ void hb_TextureBuilderGetPackagedTextureLayout(CPU& c) {
     c.x[0] = d ? d->f[16] : 0;
 }
 
+// ---- more plain getters of the builders (queue builder: memory in slot 6, its size in slot 7; window builder: texture count in slot 3)
+void hb_QueueBuilderGetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0] : 0;
+}
+
+void hb_QueueBuilderGetFlags(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[1] : 0;
+}
+
+void hb_QueueBuilderGetCommandMemorySize(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[2] : 0;
+}
+
+void hb_QueueBuilderGetComputeMemorySize(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[3] : 0;
+}
+
+void hb_QueueBuilderGetControlMemorySize(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[4] : 0;
+}
+
+void hb_QueueBuilderGetCommandFlushThreshold(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[5] : 0;
+}
+
+void hb_QueueBuilderGetMemory(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[6] : 0;
+}
+
+void hb_QueueBuilderGetMemorySize(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[7] : 0;
+}
+
+void hb_WindowBuilderGetNumActiveTextures(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[3] : 0;
+}
+
+void hb_WindowBuilderGetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0] : 0;
+}
+
+void hb_BufferBuilderGetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0] : 0;
+}
+
+void hb_TextureBuilderGetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0] : 0;
+}
+
+void hb_SamplerBuilderGetDevice(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[0] : 0;
+}
+
+void hb_DeviceBuilderGetFlags(CPU& c) {
+    std::lock_guard<std::mutex> lk(g_bd_lock);
+    BuilderData* d = bd(c.x[0]);
+    c.x[0] = d ? d->f[1] : 0;
+}
+
+
 using HostFn = void (*)(CPU&);
 struct HostProc {
     const char* name;
@@ -1574,6 +1660,20 @@ const HostProc kHostBuilderProcs[] = {
     {"nvnWindowBuilderGetTexture", hb_WindowBuilderGetTexture},
     {"nvnWindowBuilderGetTextures", hb_WindowBuilderGetTextures},
     {"nvnTextureBuilderGetPackagedTextureLayout", hb_TextureBuilderGetPackagedTextureLayout},
+    {"nvnQueueBuilderGetDevice", hb_QueueBuilderGetDevice},
+    {"nvnQueueBuilderGetFlags", hb_QueueBuilderGetFlags},
+    {"nvnQueueBuilderGetCommandMemorySize", hb_QueueBuilderGetCommandMemorySize},
+    {"nvnQueueBuilderGetComputeMemorySize", hb_QueueBuilderGetComputeMemorySize},
+    {"nvnQueueBuilderGetControlMemorySize", hb_QueueBuilderGetControlMemorySize},
+    {"nvnQueueBuilderGetCommandFlushThreshold", hb_QueueBuilderGetCommandFlushThreshold},
+    {"nvnQueueBuilderGetMemory", hb_QueueBuilderGetMemory},
+    {"nvnQueueBuilderGetMemorySize", hb_QueueBuilderGetMemorySize},
+    {"nvnWindowBuilderGetNumActiveTextures", hb_WindowBuilderGetNumActiveTextures},
+    {"nvnWindowBuilderGetDevice", hb_WindowBuilderGetDevice},
+    {"nvnBufferBuilderGetDevice", hb_BufferBuilderGetDevice},
+    {"nvnTextureBuilderGetDevice", hb_TextureBuilderGetDevice},
+    {"nvnSamplerBuilderGetDevice", hb_SamplerBuilderGetDevice},
+    {"nvnDeviceBuilderGetFlags", hb_DeviceBuilderGetFlags},
 };
 
 std::mutex g_host_lock;
@@ -1895,6 +1995,20 @@ NX_HLE("host_nvnWindowBuilderGetNumTextures", hb_WindowBuilderGetNumTextures);
 NX_HLE("host_nvnWindowBuilderGetTexture", hb_WindowBuilderGetTexture);
 NX_HLE("host_nvnWindowBuilderGetTextures", hb_WindowBuilderGetTextures);
 NX_HLE("host_nvnTextureBuilderGetPackagedTextureLayout", hb_TextureBuilderGetPackagedTextureLayout);
+NX_HLE("host_nvnQueueBuilderGetDevice", hb_QueueBuilderGetDevice);
+NX_HLE("host_nvnQueueBuilderGetFlags", hb_QueueBuilderGetFlags);
+NX_HLE("host_nvnQueueBuilderGetCommandMemorySize", hb_QueueBuilderGetCommandMemorySize);
+NX_HLE("host_nvnQueueBuilderGetComputeMemorySize", hb_QueueBuilderGetComputeMemorySize);
+NX_HLE("host_nvnQueueBuilderGetControlMemorySize", hb_QueueBuilderGetControlMemorySize);
+NX_HLE("host_nvnQueueBuilderGetCommandFlushThreshold", hb_QueueBuilderGetCommandFlushThreshold);
+NX_HLE("host_nvnQueueBuilderGetMemory", hb_QueueBuilderGetMemory);
+NX_HLE("host_nvnQueueBuilderGetMemorySize", hb_QueueBuilderGetMemorySize);
+NX_HLE("host_nvnWindowBuilderGetNumActiveTextures", hb_WindowBuilderGetNumActiveTextures);
+NX_HLE("host_nvnWindowBuilderGetDevice", hb_WindowBuilderGetDevice);
+NX_HLE("host_nvnBufferBuilderGetDevice", hb_BufferBuilderGetDevice);
+NX_HLE("host_nvnTextureBuilderGetDevice", hb_TextureBuilderGetDevice);
+NX_HLE("host_nvnSamplerBuilderGetDevice", hb_SamplerBuilderGetDevice);
+NX_HLE("host_nvnDeviceBuilderGetFlags", hb_DeviceBuilderGetFlags);
 
 namespace nvn {
 
