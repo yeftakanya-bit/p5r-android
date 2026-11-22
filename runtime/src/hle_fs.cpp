@@ -848,6 +848,7 @@ NX_HLE("_ZN2nn2fs9FlushFileENS0_10FileHandleE", FlushFile);
 NX_HLE("_ZN2nn2fs25EnableGlobalFileDataCacheEPvm", EnableGlobalFileDataCache);
 NX_HLE("_ZN2nn2fs26DisableGlobalFileDataCacheEv", DisableGlobalFileDataCache);
 NX_HLE("_ZN2nn2fs6CommitEPKc", Commit);
+NX_HLE("_ZN2nn2fs14CommitSaveDataEPKc", Commit);  // SDK 2017 name of Commit(mount name)
 NX_HLE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", OpenDirectory);
 NX_HLE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", ReadDirectory);
 NX_HLE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", CloseDirectory);
@@ -863,6 +864,47 @@ NX_HLE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", ReadFile
 NX_HLE("_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", IsSaveDataExisting);
 NX_HLE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", SetFileSize);
 NX_HLE("_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", DeleteDirectoryRecursively);
+
+// The SDK's OWN nn::fs functions. The game's imports of them go to the HLE above, but a call that is made inside the
+// sdk (or by a library bound to the sdk's definition) runs the SDK's version, which needs the fs service and aborts.
+// This hooks each such definition to the same host function. Opt in with NX_HOOK_SDK_FS=1 in config.txt: the hook
+// replaces code of the sdk, so it is off until a backtrace shows an sdk-internal call (see NX_SYM_AT in main.cpp).
+void hook_sdk_fs_functions() {
+    const char* on = std::getenv("NX_HOOK_SDK_FS");
+    if (!on || on[0] != '1') return;
+    struct Entry {
+        const char* name;
+        void (*fn)(CPU&);
+    };
+    static const Entry entries[] = {
+        {"_ZN2nn2fs10DeleteFileEPKc", DeleteFile},
+        {"_ZN2nn2fs10CreateFileEPKcl", CreateFile},
+        {"_ZN2nn2fs10CreateFileEPKcli", CreateFile},
+        {"_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", OpenFile},
+        {"_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", GetFileSize},
+        {"_ZN2nn2fs15CreateDirectoryEPKc", CreateDirectory},
+        {"_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", GetEntryType},
+        {"_ZN2nn2fs9CloseFileENS0_10FileHandleE", CloseFile},
+        {"_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", ReadFileOut},
+        {"_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", ReadFile},
+        {"_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", WriteFile},
+        {"_ZN2nn2fs9FlushFileENS0_10FileHandleE", FlushFile},
+        {"_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", SetFileSize},
+        {"_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", OpenDirectory},
+        {"_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", ReadDirectory},
+        {"_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", CloseDirectory},
+        {"_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", GetDirectoryEntryCount},
+        {"_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", DeleteDirectoryRecursively},
+        {"_ZN2nn2fs14CommitSaveDataEPKc", Commit},  // SDK 2017: the sdk's own one aborted (sdk+4a910)
+        {"_ZN2nn2fs6CommitEPKc", Commit},
+    };
+    for (const Entry& e : entries) {
+        const uint64_t addr = find_symbol(e.name);
+        if (!addr) continue;  // the sdk does not define this one (its imports are HLE already)
+        if (hook_function(addr, e.fn)) log("fs: hooked the sdk's %s at %s", e.name, describe(addr).c_str());
+        else log("fs: could not hook the sdk's %s at %s", e.name, describe(addr).c_str());
+    }
+}
 
 void log_recent_files() {
     std::unique_lock lk(g_recent_lock, std::try_to_lock);
