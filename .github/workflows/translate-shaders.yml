@@ -1,0 +1,149 @@
+name: Translate shaders (Farming Simulator)
+
+# Turns the shader pairs dumped on the phone (NX_DUMP_SHADER_MISSES=1: code_<hash>.bin + ctrl_<hash>.bin, zipped as
+# shader_misses.zip in the repository root) into <hash>.spv + results.tsv with the same Ryujinx translator the
+# P5R import uses. Download the artifact "farming-spirv" and unzip it into
+# /storage/emulated/0/Persona 5 Royal/spirv/ on the phone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: Zip with the code_<hash>.bin / ctrl_<hash>.bin pairs (path inside the repository)
+        default: shader_misses.zip
+      jobs:
+        description: Translations run in parallel
+        default: "4"
+  push:
+    paths:
+      - shader_misses.zip
+
+permissions:
+  contents: read
+
+jobs:
+  translate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      SHADER_ZIP: ${{ github.event.inputs.zip || 'shader_misses.zip' }}
+      JOBS: ${{ github.event.inputs.jobs || '4' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # The same Ryubing sources as build-p5r-android.yml (the translator is built from them).
+      - name: Download Ryubing
+        run: |
+          set -euo pipefail
+          mkdir -p private/third_party/ryubing
+          curl -fsSL -o private/third_party/ryubing.tar.gz \
+            https://codeberg.org/Software_arch/Ryubing/archive/a82350bb77.tar.gz
+          tar -xzf private/third_party/ryubing.tar.gz -C private/third_party/ryubing --strip-components=1
+          rm private/third_party/ryubing.tar.gz
+
+      # LoadJobs() (tools/maxwell/spirv_harness/Program.cs) reads every manifest.tsv under the root: it skips the
+      # header line and takes column 10 = hash, 11 = code file, 12 = ctrl file (files next to the manifest).
+      # Columns 0-9 are not read by the harness; they hold the pair's number, source, kind and sizes.
+      - name: Extract the zip and write manifest.tsv
+        run: |
+          set -euo pipefail
+          test -f "$SHADER_ZIP" || { echo "::error::$SHADER_ZIP is not in the repository"; exit 1; }
+          rm -rf work
+          mkdir -p work/zip work/extracted work/spirv_out
+          unzip -q -o "$SHADER_ZIP" -d work/zip
+
+          manifest=work/extracted/manifest.tsv
+          printf 'n\tsource\tkind\tcode_bytes\tctrl_bytes\tcol5\tcol6\tcol7\tcol8\tcol9\thash\tcode\tctrl\n' > "$manifest"
+          : > work/skipped.txt
+          n=0
+          while IFS= read -r -d '' code; do
+            base=$(basename "$code")
+            hash=${base#code_}
+            hash=${hash%.bin}
+            ctrl="$(dirname "$code")/ctrl_${hash}.bin"
+            if [ ! -f "$ctrl" ]; then
+              echo "$hash: no ctrl_$hash.bin next to it" >> work/skipped.txt
+              continue
+            fi
+            code_size=$(stat -c %s "$code")
+            ctrl_size=$(stat -c %s "$ctrl")
+            # The harness reads the control section up to offset 0x74b (1868 bytes) and the SPH in the code.
+            if [ "$ctrl_size" -lt 1868 ] || [ "$code_size" -lt 64 ]; then
+              echo "$hash: too small (code $code_size, ctrl $ctrl_size bytes)" >> work/skipped.txt
+              continue
+            fi
+            if [ -f "work/extracted/code_${hash}.bin" ]; then
+              continue  # the same hash twice: translated once
+            fi
+            cp "$code" "work/extracted/code_${hash}.bin"
+            cp "$ctrl" "work/extracted/ctrl_${hash}.bin"
+            printf '%d\t%s\t%s\t%d\t%d\t-\t-\t-\t-\t-\t%s\tcode_%s.bin\tctrl_%s.bin\n' \
+              "$n" "$SHADER_ZIP" misses "$code_size" "$ctrl_size" "$hash" "$hash" "$hash" >> "$manifest"
+            n=$((n + 1))
+          done < <(find work/zip -type f -name 'code_*.bin' -print0 | sort -z)
+
+          echo "pairs for the translator: $n"
+          if [ -s work/skipped.txt ]; then
+            echo "skipped:"
+            cat work/skipped.txt
+          fi
+          if [ "$n" -eq 0 ]; then
+            echo "::error::no usable code_<hash>.bin / ctrl_<hash>.bin pair in $SHADER_ZIP (see the skipped list above)"
+            echo "zip contents:"
+            unzip -l "$SHADER_ZIP" | head -30
+            exit 1
+          fi
+          head -3 "$manifest"
+
+      - name: Show the harness project
+        run: |
+          grep -E "OutputType|TargetFramework|PublishAot|ProjectReference|Compile " \
+            tools/maxwell/spirv_harness/SpirvHarness.csproj || true
+
+      - name: Translate
+        run: |
+          set -euo pipefail
+          dotnet run --project tools/maxwell/spirv_harness/SpirvHarness.csproj -c Release -- \
+            --batch work/extracted --out work/spirv_out --jobs "$JOBS" --no-val
+
+      - name: Check the result
+        run: |
+          set -euo pipefail
+          spv=$(find work/spirv_out -name '*.spv' | wc -l)
+          echo "$spv .spv files"
+          if [ "$spv" -eq 0 ]; then
+            echo "::error::the translator wrote no .spv file"
+            cat work/spirv_out/summary.txt 2>/dev/null || true
+            exit 1
+          fi
+          echo "blocks that did not translate cleanly (status is not ok / ok-retry):"
+          awk -F'\t' 'NR > 1 && $5 != "ok" && $5 != "ok-retry" {print $1, $3, $5, $10}' work/spirv_out/results.tsv | cut -c1-300 | head -40 || true
+          {
+            echo '### Shader translation'
+            echo
+            echo "$spv .spv files"
+            echo
+            echo '```'
+            head -40 work/spirv_out/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # <hash>.spv, results.tsv and summary.txt: unzip into /storage/emulated/0/Persona 5 Royal/spirv/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: farming-spirv
+          path: work/spirv_out/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: farming-spirv-debug
+          path: |
+            work/extracted/manifest.tsv
+            work/skipped.txt
+          if-no-files-found: ignore
