@@ -28,8 +28,7 @@ const std::map<uint32_t, int32_t> kDeviceInfo = {
     {6, 0x10},
     {7, 0x4},
     {8, 0x10},
-    {9, 0x0},  // Farming Simulator (SDK 2017): its check "LINEAR_TEXTURE_STRIDE_ALIGNMENT is %d, should be 0" wants 0. This table
-               // is the SDK 16 numbering; 0x20 was what P5R and Wonder get here.
+    {9, 0x20},
     {10, 0x10},
     {11, 0x4},
     {12, 0x4},
@@ -76,7 +75,8 @@ const std::map<uint32_t, int32_t> kDeviceInfo = {
     {53, 0x4},
     {54, 0x20},
     {55, 0x800},  // provisional: the driver reads [dev+0xac]
-    {56, 0x0},  // provisional: the driver reads [dev+0x44]
+    {56, 0x20},  // LINEAR_TEXTURE_STRIDE_ALIGNMENT in Farming Simulator's (SDK 2017) numbering: its check prints "is 32, should
+                 // be 0" while this returned 0 (the placeholder); the real value on a Switch is 32. (The SDK 16 driver reads [dev+0x44].)
     {57, 0x80},
     {58, 0x0},  // provisional: the driver reads [dev+0xc8]
     {59, 0x1},  // provisional: the driver reads !byte[dev+0x1b1d]
