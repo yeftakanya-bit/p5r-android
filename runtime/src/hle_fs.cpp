@@ -394,15 +394,30 @@ void DisableGlobalFileDataCache(CPU& c) { c.x[0] = kOk; }
 
 // ---- files ----------------------------------------------------------------------------------------------------
 
+// nn::fs::CreateFile(path, size) and, in SDK 2017, CreateFile(path, size, option): the option (x2, a
+// CreateFileOption) changes nothing here, so one function serves both names.
+// A missing parent folder is created (real hardware returns PathNotFound and the game makes the folders first; this
+// port's save folder starts empty, so the subfolders of a save path are made on demand). A path with ".." is refused.
 void CreateFile(CPU& c) {
     std::lock_guard lk(g_fs);
-    fs::path p = resolve(cstr(c.x[0]));
+    const std::string guest = cstr(c.x[0]);
+    fs::path p = guest.find("..") == std::string::npos ? resolve(guest) : fs::path();
     int64_t size = int64_t(c.x[1]);
-    if (p.empty() || !fs::exists(p.parent_path())) {
+    if (p.empty() || p.parent_path().empty()) {
         c.x[0] = kPathNotFound;
         return;
     }
-    if (fs::exists(p)) {
+    std::error_code ec;
+    if (!fs::exists(p.parent_path(), ec)) {
+        fs::create_directories(p.parent_path(), ec);
+        if (ec || !fs::is_directory(p.parent_path(), ec)) {
+            log("fs: CreateFile %s: cannot create the parent folder", guest.c_str());
+            c.x[0] = kPathNotFound;
+            return;
+        }
+        log("fs: CreateFile %s: the parent folder did not exist, created", guest.c_str());
+    }
+    if (fs::exists(p, ec)) {
         c.x[0] = kPathAlreadyExists;
         return;
     }
@@ -820,6 +835,7 @@ NX_HLE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", MountSaveData);
 NX_HLE("_ZN2nn2fs7UnmountEPKc", Unmount);
 NX_HLE("_ZN2nn2fs10DeleteFileEPKc", DeleteFile);
 NX_HLE("_ZN2nn2fs10CreateFileEPKcl", CreateFile);
+NX_HLE("_ZN2nn2fs10CreateFileEPKcli", CreateFile);  // SDK 2017: with the option argument
 NX_HLE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", OpenFile);
 NX_HLE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", GetFileSize);
 NX_HLE("_ZN2nn2fs15CreateDirectoryEPKc", CreateDirectory);
