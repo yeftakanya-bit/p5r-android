@@ -158,23 +158,80 @@ static bool cas32(uint64_t a, uint32_t expected, uint32_t v) {
                                        __ATOMIC_SEQ_CST);
 }
 
-// Hand the mutex at `addr` to its next waiter (or clear it).
-static void unlock_mutex(uint64_t addr) {
+// ---- history of the mutex operations (g_k held for every write) ------------------------------------------------
+// The last 16384 mutex events: who asked for, released or was handed which mutex word, and what the word was before
+// and after. When a mutex is stuck, the report prints the events of that address: the sequence that left it owned by
+// a thread that never locked it, or never unlocked it.
+struct MutexEvent {
+    uint64_t ns = 0, addr = 0;
+    uint32_t by = 0, other = 0, before = 0, after = 0;
+    const char* what = "";
+};
+static MutexEvent g_mev[16384];
+static uint64_t g_mev_count = 0;
+
+static void mutex_event(const char* what, uint64_t addr, uint32_t by, uint32_t before, uint32_t after,
+                        uint32_t other = 0) {
+    MutexEvent& e = g_mev[g_mev_count++ % (sizeof g_mev / sizeof g_mev[0])];
+    e = {plat::monotonic_ns(), addr, by, other, before, after, what};
+}
+
+static void dump_mutex_events(uint64_t addr, size_t max_lines) {
+    const uint64_t total = std::min<uint64_t>(g_mev_count, sizeof g_mev / sizeof g_mev[0]);
+    std::vector<const MutexEvent*> hits;
+    for (uint64_t i = 0; i < total; i++) {
+        const MutexEvent& e = g_mev[(g_mev_count - total + i) % (sizeof g_mev / sizeof g_mev[0])];
+        if (e.addr == addr) hits.push_back(&e);
+    }
+    const uint64_t now = plat::monotonic_ns();
+    log("kernel: the last %zu of %zu events on the mutex at %llx (oldest first):", std::min(hits.size(), max_lines),
+        hits.size(), (unsigned long long)addr);
+    for (size_t i = hits.size() > max_lines ? hits.size() - max_lines : 0; i < hits.size(); i++) {
+        const MutexEvent& e = *hits[i];
+        log("  %8.1f ms ago  thread %x  %-34s word %08x -> %08x  other thread %x", double(now - e.ns) / 1e6, e.by,
+            e.what, e.before, e.after, e.other);
+    }
+}
+
+// Hand the mutex at `addr` to its next waiter (or clear it). `by` is the thread whose action releases it.
+static void unlock_mutex(uint64_t addr, const char* why = "unlock", uint32_t by = 0) {
     KThread* next = nullptr;
     int more = 0;
-    for (KThread* t : g_mutex_waiters)
-        if (t->wait_mutex == addr) {
-            if (!next)
-                next = t;
-            else
-                more++;
+    // A thread that waits for a mutex is in g_mutex_waiters and nowhere else (a signalled condvar waiter leaves the
+    // condvar list before it is queued for its mutex). One that is also in another wait list is not waiting for this
+    // mutex any more: giving it the mutex would leave the word owned by a thread that never takes it, forever. Such
+    // a ghost entry is dropped and logged.
+    for (size_t i = 0; i < g_mutex_waiters.size();) {
+        KThread* t = g_mutex_waiters[i];
+        if (t->wait_mutex != addr) {
+            i++;
+            continue;
         }
+        auto in = [&](const std::vector<KThread*>& v) { return std::find(v.begin(), v.end(), t) != v.end(); };
+        if (in(g_cv_waiters) || in(g_addr_waiters) || in(g_sync_waiters)) {
+            log("kernel: ghost waiter: thread %llu (handle %x) is queued for the mutex at %llx but also waits elsewhere: "
+                "dropped from the mutex queue",
+                (unsigned long long)t->id, t->handle, (unsigned long long)addr);
+            mutex_event("ghost waiter dropped", addr, by, load32(addr), load32(addr), t->handle);
+            g_mutex_waiters.erase(g_mutex_waiters.begin() + i);
+            continue;
+        }
+        if (!next)
+            next = t;
+        else
+            more++;
+        i++;
+    }
+    const uint32_t before = load32(addr);
     if (!next) {
         store32(addr, 0);
+        mutex_event(why, addr, by, before, 0, 0);
         return;
     }
     remove(g_mutex_waiters, next);
-    store32(addr, next->wait_tag | (more ? kHandleWaitMask : 0));
+    const uint32_t after = next->wait_tag | (more ? kHandleWaitMask : 0);
+    store32(addr, after);
+    mutex_event(why, addr, by, before, after, next->handle);
     wake(next);
 }
 
@@ -194,7 +251,7 @@ static void release_mutexes_of_exiting(KThread* t) {
     for (uint64_t a : addrs) {
         log("kernel: thread %llu (handle %x) exits still owning the mutex at %llx: handed to its next waiter",
             (unsigned long long)t->id, t->handle, (unsigned long long)a);
-        unlock_mutex(a);
+        unlock_mutex(a, "exit: hand over", t->handle);
     }
 }
 
@@ -329,13 +386,18 @@ void kernel_dump_all_threads(const char* reason, uint32_t focus_handle) {
 static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) {
     std::unique_lock lk(g_k);
     KThread* self = t_self;
-    if (load32(addr) != (owner | kHandleWaitMask)) return 0;
+    if (load32(addr) != (owner | kHandleWaitMask)) {
+        mutex_event("lock: word changed, no wait", addr, self->handle, load32(addr), load32(addr), owner);
+        return 0;
+    }
     if (thread_exited(owner)) {
         // The owner is gone and will never unlock it: this thread takes the mutex over (and others waiting stay
         // waiting behind it, as the waiters bit says).
         bool more = false;
         for (KThread* w : g_mutex_waiters)
             if (w->wait_mutex == addr) more = true;
+        mutex_event("lock: takeover (owner exited)", addr, self->handle, load32(addr),
+                    tag | (more ? kHandleWaitMask : 0), owner);
         store32(addr, tag | (more ? kHandleWaitMask : 0));
         static std::atomic<int> takeovers{0};
         if (takeovers.fetch_add(1) < 20)
@@ -347,9 +409,14 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
     self->wait_mutex = addr;
     self->wait_tag = tag;
     g_mutex_waiters.push_back(self);
-    if (block(lk, self, 5'000'000'000)) return self->wait_result;
+    mutex_event("lock: waits for the owner", addr, self->handle, load32(addr), load32(addr), owner);
+    if (block(lk, self, 5'000'000'000)) {
+        mutex_event("lock: woken, owns it", addr, self->handle, load32(addr), load32(addr), 0);
+        return self->wait_result;
+    }
     static std::set<uint64_t> reported;  // g_k held
     if (reported.insert(addr).second) {
+        dump_mutex_events(addr, 80);
         const uint32_t word = load32(addr);
         const uint32_t owner_now = word & ~uint32_t(kHandleWaitMask);
         bool owner_known = false, owner_exited = false;
@@ -372,7 +439,7 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
 
 static uint32_t svc_arbitrate_unlock(uint64_t addr) {
     std::unique_lock lk(g_k);
-    unlock_mutex(addr);
+    unlock_mutex(addr, "ArbitrateUnlock", t_self ? t_self->handle : 0);
     return 0;
 }
 
@@ -388,8 +455,9 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     self->wait_tag = tag;
     self->wait_result = 0;
     g_cv_waiters.push_back(self);
+    mutex_event("cv wait (its mutex)", mutex, self->handle, load32(mutex), load32(mutex), uint32_t(key));
     store32(key, 1);
-    unlock_mutex(mutex);
+    unlock_mutex(mutex, "cv wait releases it", self->handle);
     if (block(lk, self, timeout)) return self->wait_result;
     // Timed out (not handed the mutex): leave the condvar, or the mutex queue a signal moved us to, and return
     // without the mutex. Like Horizon: the SDK re-locks it itself (TimedWait -> InternalCriticalSection::Enter);
@@ -417,10 +485,14 @@ static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
             uint32_t v = load32(t->wait_mutex);
             if (v == 0) {
                 if (!cas32(t->wait_mutex, 0, t->wait_tag)) continue;
+                mutex_event("signal: gave it to the waiter", t->wait_mutex, t_self ? t_self->handle : 0, 0, t->wait_tag,
+                            t->handle);
                 wake(t);
                 break;
             }
             if (!(v & kHandleWaitMask) && !cas32(t->wait_mutex, v, v | kHandleWaitMask)) continue;
+            mutex_event("signal: waiter queued for its mutex", t->wait_mutex, t_self ? t_self->handle : 0, v,
+                        v | kHandleWaitMask, t->handle);
             g_mutex_waiters.push_back(t);
             break;
         }
