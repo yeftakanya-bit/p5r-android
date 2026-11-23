@@ -443,6 +443,47 @@ static uint32_t svc_arbitrate_unlock(uint64_t addr) {
     return 0;
 }
 
+// ---- condition variable bookkeeping (semaphores, light events and every SDK wait are built on these) -----------------
+// Per key (the condvar's address): how many waits and signals were seen, and who signalled last. A thread that waits for
+// ever while its key shows "0 signals" is waiting for a post nobody made; one whose key shows signals that woke nobody
+// points at a lost wake-up. NX_TRACE_ADDR=<hex key> also logs every wait and signal on that key.
+static uint64_t trace_addr();
+struct KeyStats {
+    uint64_t waits = 0, signals = 0, woken = 0, last_signal_ns = 0;
+    uint32_t last_signal_by = 0;
+};
+static std::unordered_map<uint64_t, KeyStats> g_key_stats;  // g_k held
+
+// The main thread has waited 5 s on a condvar: say what it waits for (g_k held).
+static void report_main_cv_wait(KThread* self, uint64_t key, uint64_t mutex) {
+    const KeyStats st = g_key_stats[key];
+    const uint64_t now = plat::monotonic_ns();
+    std::string last = "never";
+    if (st.signals) {
+        char b[48];
+        std::snprintf(b, sizeof b, " ms ago by thread %x", st.last_signal_by);
+        last = std::to_string((now - st.last_signal_ns) / 1000000) + b;
+    }
+    log("kernel: the main thread (handle %x) has waited 5 s on the condvar %llx (mutex %llx): %llu waits, %llu signals "
+        "(%llu threads woken) on that key, last signal %s",
+        self->handle, (unsigned long long)key, (unsigned long long)mutex, (unsigned long long)st.waits,
+        (unsigned long long)st.signals, (unsigned long long)st.woken, last.c_str());
+    // The semaphore object around the key: its count and limits are the words next to its mutex and condvar.
+    std::string words;
+    for (int i = -12; i <= 6; i++) {
+        char b[24];
+        std::snprintf(b, sizeof b, "%s%08x", i == 0 ? " [" : " ", load32(key + 4 * i));
+        words += b;
+        if (i == 0) words += "]";
+    }
+    log("kernel: memory around the key (u32 words from key-0x30):%s", words.c_str());
+    for (KThread* t : g_cv_waiters) {
+        const KeyStats& k = g_key_stats[t->wait_key];
+        log("kernel:   thread %llu (handle %x) waits on key %llx: %llu waits, %llu signals on it", (unsigned long long)t->id,
+            t->handle, (unsigned long long)t->wait_key, (unsigned long long)k.waits, (unsigned long long)k.signals);
+    }
+}
+
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
     std::unique_lock lk(g_k);
     KThread* self = t_self;
@@ -456,9 +497,21 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     self->wait_result = 0;
     g_cv_waiters.push_back(self);
     mutex_event("cv wait (its mutex)", mutex, self->handle, load32(mutex), load32(mutex), uint32_t(key));
+    g_key_stats[key].waits++;
+    if (key == trace_addr())
+        log("cv: thread %x waits on %llx (mutex %llx, timeout %lld)", self->handle, (unsigned long long)key,
+            (unsigned long long)mutex, (long long)timeout);
     store32(key, 1);
     unlock_mutex(mutex, "cv wait releases it", self->handle);
-    if (block(lk, self, timeout)) return self->wait_result;
+    if (timeout < 0 && self->entry == 0) {
+        // The main thread waiting for ever: after 5 s say what it waits for, once per key, then keep waiting.
+        if (block(lk, self, 5'000'000'000)) return self->wait_result;
+        static std::set<uint64_t> reported_keys;  // g_k held
+        if (reported_keys.insert(key).second) report_main_cv_wait(self, key, mutex);
+        if (block(lk, self, -1)) return self->wait_result;
+    }
+    if (timeout >= 0 || self->entry != 0)
+        if (block(lk, self, timeout)) return self->wait_result;
     // Timed out (not handed the mutex): leave the condvar, or the mutex queue a signal moved us to, and return
     // without the mutex. Like Horizon: the SDK re-locks it itself (TimedWait -> InternalCriticalSection::Enter);
     // returning with it held made that Enter wait on ourselves forever.
@@ -497,6 +550,16 @@ static uint32_t svc_signal_process_wide_key(uint64_t key, int32_t count) {
             break;
         }
     }
+    {
+        KeyStats& st = g_key_stats[key];
+        st.signals++;
+        st.woken += uint64_t(n);
+        st.last_signal_ns = plat::monotonic_ns();
+        st.last_signal_by = t_self ? t_self->handle : 0;
+    }
+    if (key == trace_addr())
+        log("cv: thread %x signals %llx (count %d): %d woken", t_self ? t_self->handle : 0, (unsigned long long)key,
+            count, n);
     bool others = std::any_of(g_cv_waiters.begin(), g_cv_waiters.end(), [&](KThread* t) { return t->wait_key == key; });
     if (!others) store32(key, 0);
     return 0;
@@ -736,6 +799,61 @@ static void write_meminfo(uint64_t p, const VmInfo& v) {
     st<uint32_t>(p + 36, 0);
 }
 
+// The last svcs each thread made, printed when it exits: what a thread that ends right after it starts was doing.
+namespace {
+struct SvcRing {
+    uint16_t imm[16] = {};
+    uint32_t n = 0;
+};
+thread_local SvcRing t_ring;
+
+const char* svc_name(uint32_t imm) {
+    switch (imm) {
+        case 0x01: return "SetHeapSize";
+        case 0x06: return "QueryMemory";
+        case 0x08: return "CreateThread";
+        case 0x09: return "StartThread";
+        case 0x0A: return "ExitThread";
+        case 0x0B: return "SleepThread";
+        case 0x0C: return "GetThreadPriority";
+        case 0x0D: return "SetThreadPriority";
+        case 0x0F: return "SetThreadCoreMask";
+        case 0x11: return "SignalEvent";
+        case 0x12: return "ClearEvent";
+        case 0x16: return "CloseHandle";
+        case 0x17: return "ResetSignal";
+        case 0x18: return "WaitSynchronization";
+        case 0x19: return "CancelSynchronization";
+        case 0x1A: return "ArbitrateLock";
+        case 0x1B: return "ArbitrateUnlock";
+        case 0x1C: return "WaitProcessWideKeyAtomic";
+        case 0x1D: return "SignalProcessWideKey";
+        case 0x1E: return "GetSystemTick";
+        case 0x1F: return "ConnectToNamedPort";
+        case 0x21: return "SendSyncRequest";
+        case 0x25: return "GetThreadId";
+        case 0x26: return "Break";
+        case 0x27: return "OutputDebugString";
+        case 0x29: return "GetInfo";
+        case 0x34: return "WaitForAddress";
+        case 0x35: return "SignalToAddress";
+        default: return "?";
+    }
+}
+
+// The calling thread's last svcs, oldest first.
+std::string recent_svcs() {
+    std::string out;
+    const uint32_t n = t_ring.n;
+    for (uint32_t i = n > 16 ? n - 16 : 0; i < n; i++) {
+        char b[48];
+        std::snprintf(b, sizeof b, "%s%s(%#x)", out.empty() ? "" : " ", svc_name(t_ring.imm[i & 15]), t_ring.imm[i & 15]);
+        out += b;
+    }
+    return out;
+}
+}  // namespace
+
 static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
     if (g_trace) log("svc %#x from %s", imm, describe(pc).c_str());
     uint32_t rc = 0;
@@ -845,6 +963,7 @@ static void svc_impl(CPU& c, uint32_t imm, uint64_t pc) {
                     log("kernel: thread %llu (handle %x) calls svcExitThread:", (unsigned long long)t_self->id,
                         t_self->handle);
                     backtrace(c);
+                    log("kernel:   its last svcs: %s", recent_svcs().c_str());
                 }
                 std::lock_guard lk(g_k);
                 release_mutexes_of_exiting(t_self);
@@ -1083,6 +1202,7 @@ void svc_profile_report(uint64_t frames, int role) {
 }
 
 void svc(CPU& c, uint32_t imm, uint64_t pc) {
+    t_ring.imm[t_ring.n++ & 15] = uint16_t(imm);
     if (!t_svc_role || !svc_profile_on()) return svc_impl(c, imm, pc);
     uint64_t t0 = plat::monotonic_ns();
     svc_impl(c, imm, pc);
